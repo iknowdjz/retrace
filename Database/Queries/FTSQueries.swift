@@ -308,25 +308,32 @@ enum FTSQueries {
             )
         }
 
+        // Prepared once for the whole loop, like contentStatement above. Preparing
+        // inside the loop re-parsed and re-planned this statement for every docid,
+        // and deleteForFrame is itself called once per frame by the retention purge
+        // (FrameQueries.deleteFramesByIDs), so the parse cost multiplied out across
+        // every frame in a purge.
+        let stillReferencedSQL = """
+            SELECT 1
+            FROM doc_segment
+            WHERE docid = ?
+            LIMIT 1;
+            """
+        var referencedStatement: OpaquePointer?
+        defer {
+            sqlite3_finalize(referencedStatement)
+        }
+
+        guard sqlite3_prepare_v2(db, stillReferencedSQL, -1, &referencedStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: stillReferencedSQL,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
         for docid in docids {
-            let stillReferencedSQL = """
-                SELECT 1
-                FROM doc_segment
-                WHERE docid = ?
-                LIMIT 1;
-                """
-            var referencedStatement: OpaquePointer?
-            defer {
-                sqlite3_finalize(referencedStatement)
-            }
-
-            guard sqlite3_prepare_v2(db, stillReferencedSQL, -1, &referencedStatement, nil) == SQLITE_OK else {
-                throw DatabaseError.queryFailed(
-                    query: stillReferencedSQL,
-                    underlying: String(cString: sqlite3_errmsg(db))
-                )
-            }
-
+            sqlite3_reset(referencedStatement)
+            sqlite3_clear_bindings(referencedStatement)
             sqlite3_bind_int64(referencedStatement, 1, docid)
             if sqlite3_step(referencedStatement) == SQLITE_ROW {
                 continue
