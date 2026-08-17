@@ -269,6 +269,124 @@ final class DeduplicationTests: XCTestCase {
     }
 
     // ┌──────────────────────────────────────────────────────────────────────────┐
+    // │              Single-Scan Deduplication (issue-38: CaptureManager:857)     │
+    // └──────────────────────────────────────────────────────────────────────────┘
+
+    /// Pins `CaptureManager.shouldKeepFrameForSimilarity` to `FrameDeduplicator.shouldKeepFrame`.
+    ///
+    /// The capture path derives the keep decision from an already-computed similarity
+    /// score instead of rerunning the scan. If the two ever diverge, the always-on
+    /// capture path silently starts keeping or dropping the wrong frames, so this
+    /// asserts they agree on every combination rather than spot-checking.
+    func testShouldKeepFrameForSimilarity_MatchesDeduplicator() {
+        let patterns: [UInt8] = [80, 82, 150, 200]
+        let thresholds: [Double] = [0.0, 0.02, 0.5, 0.98, 0.9985, 1.0]
+
+        var reference: [CapturedFrame] = patterns.map {
+            createTestFrame(imageData: createTestImageData(width: 120, height: 90, color: $0),
+                            width: 120, height: 90)
+        }
+        // Include a differently-sized frame so the dimension-change branch is covered.
+        reference.append(createTestFrame(
+            imageData: createTestImageData(width: 160, height: 90, color: 80),
+            width: 160, height: 90
+        ))
+
+        var comparisons = 0
+        for frame in reference {
+            for candidate in reference {
+                for threshold in thresholds {
+                    let expected = deduplicator.shouldKeepFrame(
+                        frame, comparedTo: candidate, threshold: threshold
+                    )
+                    let similarity = deduplicator.computeSimilarity(frame, candidate)
+                    let actual = CaptureManager.shouldKeepFrameForSimilarity(
+                        frame, comparedTo: candidate, similarity: similarity, threshold: threshold
+                    )
+
+                    XCTAssertEqual(
+                        actual, expected,
+                        """
+                        Divergence at \(frame.width)x\(frame.height) vs \
+                        \(candidate.width)x\(candidate.height), threshold \(threshold), \
+                        similarity \(similarity): derived=\(actual) deduplicator=\(expected)
+                        """
+                    )
+                    comparisons += 1
+                }
+            }
+        }
+
+        XCTAssertGreaterThan(comparisons, 0, "Equivalence matrix must actually run")
+
+        // The nil-reference case cannot be expressed through computeSimilarity.
+        XCTAssertTrue(
+            CaptureManager.shouldKeepFrameForSimilarity(
+                reference[0], comparedTo: nil, similarity: nil, threshold: 0.9985
+            ),
+            "A frame with no reference must always be kept"
+        )
+        XCTAssertTrue(
+            deduplicator.shouldKeepFrame(reference[0], comparedTo: nil, threshold: 0.9985),
+            "Deduplicator must agree that a frame with no reference is kept"
+        )
+    }
+
+    /// Measures the saving from computing the similarity scan once per frame instead
+    /// of twice, at the frame size this actually runs at in production (3440x1440).
+    func testSingleScanDeduplication_HalvesSimilarityWork() {
+        let width = 3440
+        let height = 1440
+        let frame = createTestFrame(
+            imageData: createTestImageData(width: width, height: height, color: 128),
+            width: width, height: height
+        )
+        let reference = createTestFrame(
+            imageData: createTestImageData(width: width, height: height, color: 130),
+            width: width, height: height
+        )
+        let threshold = 0.9985
+        let iterations = 20
+
+        // Before: one scan for the log line, a second inside shouldKeepFrame.
+        let beforeStart = DispatchTime.now()
+        for _ in 0..<iterations {
+            let similarity = deduplicator.computeSimilarity(frame, reference)
+            let keep = deduplicator.shouldKeepFrame(frame, comparedTo: reference, threshold: threshold)
+            XCTAssertNotNil(similarity)
+            XCTAssertNotNil(keep)
+        }
+        let beforeMs = Double(DispatchTime.now().uptimeNanoseconds - beforeStart.uptimeNanoseconds) / 1_000_000
+
+        // After: one scan, decision derived from it.
+        let afterStart = DispatchTime.now()
+        for _ in 0..<iterations {
+            let similarity = deduplicator.computeSimilarity(frame, reference)
+            let keep = CaptureManager.shouldKeepFrameForSimilarity(
+                frame, comparedTo: reference, similarity: similarity, threshold: threshold
+            )
+            XCTAssertNotNil(keep)
+        }
+        let afterMs = Double(DispatchTime.now().uptimeNanoseconds - afterStart.uptimeNanoseconds) / 1_000_000
+
+        print("""
+        [issue-38 CaptureManager:857] similarity scans per captured frame: 2 -> 1
+          before: \(String(format: "%.2f", beforeMs)) ms / \(iterations) frames \
+        (\(String(format: "%.3f", beforeMs / Double(iterations))) ms per frame)
+          after:  \(String(format: "%.2f", afterMs)) ms / \(iterations) frames \
+        (\(String(format: "%.3f", afterMs / Double(iterations))) ms per frame)
+          reduction: \(String(format: "%.1f", (1 - afterMs / beforeMs) * 100))%
+        """)
+
+        // Generous bound: the machine under test is heavily loaded, but dropping one
+        // of two identical full scans cannot plausibly land above 80% of the old cost.
+        XCTAssertLessThan(
+            afterMs, beforeMs * 0.8,
+            "Single-scan dedup should be meaningfully cheaper (before \(beforeMs) ms, after \(afterMs) ms)"
+        )
+    }
+
+    // ┌──────────────────────────────────────────────────────────────────────────┐
     // │                           Test Helpers                                   │
     // └──────────────────────────────────────────────────────────────────────────┘
 

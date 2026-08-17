@@ -854,10 +854,15 @@ public actor CaptureManager: CaptureProtocol {
             : nil
 
         if currentConfig.adaptiveCaptureEnabled {
+            // Run the similarity scan once and derive the keep decision from the
+            // result. shouldKeepFrame would otherwise repeat the identical full
+            // sampling scan, so the always-on capture path paid for it twice per
+            // frame: once for the log line below, once for the decision.
             let similarity = lastKeptFrame.map { deduplicator.computeSimilarity(frame, $0) }
-            let keepBySimilarity = deduplicator.shouldKeepFrame(
+            let keepBySimilarity = Self.shouldKeepFrameForSimilarity(
                 frame,
                 comparedTo: lastKeptFrame,
+                similarity: similarity,
                 threshold: currentConfig.deduplicationThreshold
             )
             let keepByMouseMovement = Self.shouldKeepFrameForMouseMovement(
@@ -995,6 +1000,34 @@ public actor CaptureManager: CaptureProtocol {
             category: .capture,
             minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
+    }
+
+    /// Derives the similarity keep decision from an already-computed similarity score.
+    ///
+    /// Semantically identical to `FrameDeduplicator.shouldKeepFrame(_:comparedTo:threshold:)`,
+    /// but takes the similarity as input instead of recomputing it. The capture path
+    /// already computes the score for its diagnostic log line, and the sampling scan
+    /// walks ~10k pixels across two full-resolution frame buffers, so running it twice
+    /// per captured frame doubled the cost of every dedup decision.
+    ///
+    /// `DeduplicationTests.testShouldKeepFrameForSimilarity_MatchesDeduplicator` pins
+    /// the two implementations together.
+    static func shouldKeepFrameForSimilarity(
+        _ frame: CapturedFrame,
+        comparedTo reference: CapturedFrame?,
+        similarity: Double?,
+        threshold: Double
+    ) -> Bool {
+        // No reference frame: always keep, matching shouldKeepFrame.
+        guard let reference, let similarity else { return true }
+
+        // A dimension change is always kept, without consulting the score.
+        if frame.width != reference.width || frame.height != reference.height {
+            return true
+        }
+
+        // Keep when the frame changed more than the threshold allows.
+        return similarity <= threshold
     }
 
     static func shouldKeepFrameForMouseMovement(
