@@ -2347,16 +2347,109 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var pendingDeleteOperation: PendingDeleteOperation?
     private var pendingDeleteCommitTask: Task<Void, Never>?
 
-    private enum DiskFrameBufferEntryOrigin: String, Sendable {
+    enum DiskFrameBufferEntryOrigin: String, Sendable {
         case timelineManaged
         case externalCapture
     }
 
-    private struct DiskFrameBufferEntry: Sendable {
+    struct DiskFrameBufferEntry: Sendable {
         let fileURL: URL
         let sizeBytes: Int64
         var lastAccessSequence: UInt64
         let origin: DiskFrameBufferEntryOrigin
+    }
+
+    /// LRU index over the timeline's on-disk JPEG frame buffer.
+    ///
+    /// `totalBytes` is maintained incrementally on insert/remove so hot-path LRU
+    /// touches stay O(1); the previous `didSet` re-reduced every entry on each
+    /// mutation, scrub-time touches included.
+    struct DiskFrameBufferIndex {
+        private(set) var entries: [FrameID: DiskFrameBufferEntry] = [:]
+        private(set) var totalBytes: Int64 = 0
+        private var accessSequence: UInt64 = 0
+
+        var count: Int { entries.count }
+        var frameIDs: [FrameID] { Array(entries.keys) }
+
+        subscript(frameID: FrameID) -> DiskFrameBufferEntry? { entries[frameID] }
+
+        mutating func removeAll() {
+            entries.removeAll()
+            totalBytes = 0
+            accessSequence = 0
+        }
+
+        /// Inserts (or replaces) an entry, stamped as the most recently used.
+        @discardableResult
+        mutating func insert(
+            frameID: FrameID,
+            fileURL: URL,
+            sizeBytes: Int64,
+            origin: DiskFrameBufferEntryOrigin
+        ) -> DiskFrameBufferEntry {
+            accessSequence &+= 1
+            let entry = DiskFrameBufferEntry(
+                fileURL: fileURL,
+                sizeBytes: sizeBytes,
+                lastAccessSequence: accessSequence,
+                origin: origin
+            )
+            if let replaced = entries.updateValue(entry, forKey: frameID) {
+                totalBytes -= replaced.sizeBytes
+            }
+            totalBytes += sizeBytes
+            return entry
+        }
+
+        /// Marks an entry as most recently used. No-op for unknown frames.
+        mutating func touch(_ frameID: FrameID) {
+            guard var entry = entries[frameID] else { return }
+            accessSequence &+= 1
+            entry.lastAccessSequence = accessSequence
+            entries[frameID] = entry
+        }
+
+        @discardableResult
+        mutating func remove(_ frameID: FrameID) -> DiskFrameBufferEntry? {
+            guard let entry = entries.removeValue(forKey: frameID) else { return nil }
+            totalBytes -= entry.sizeBytes
+            return entry
+        }
+
+        /// Least-recently-used entries to drop so `totalBytes` falls back to `maxBytes`.
+        ///
+        /// Only `.timelineManaged` entries are eligible: `.externalCapture` files belong
+        /// to another writer and are deliberately preserved on removal, so evicting one
+        /// would shrink the index without reclaiming any disk space. Frames in
+        /// `protectedFrameIDs` (in-flight reads, the displayed frame, queued prefetches)
+        /// are never returned.
+        func evictionCandidates(
+            maxBytes: Int64,
+            protecting protectedFrameIDs: Set<FrameID>
+        ) -> [FrameID] {
+            guard totalBytes > maxBytes else { return [] }
+            var remainingOverage = totalBytes - maxBytes
+            let evictable = entries
+                .filter { $0.value.origin == .timelineManaged && !protectedFrameIDs.contains($0.key) }
+                .sorted { $0.value.lastAccessSequence < $1.value.lastAccessSequence }
+
+            var candidates: [FrameID] = []
+            for (frameID, entry) in evictable {
+                guard remainingOverage > 0 else { break }
+                candidates.append(frameID)
+                remainingOverage -= entry.sizeBytes
+            }
+            return candidates
+        }
+
+        /// Recomputes the byte total from the entries; used to verify that the
+        /// incremental accounting stayed exact.
+        func recomputedTotalBytes() -> Int64 {
+            entries.values.reduce(into: Int64(0)) { total, entry in
+                total += entry.sizeBytes
+            }
+        }
     }
 
     private struct DiskFrameBufferTelemetry {
@@ -2378,25 +2471,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Disk-backed timeline frame buffer metadata (payload bytes are stored in Library/Caches).
-    private var diskFrameBufferIndex: [FrameID: DiskFrameBufferEntry] = [:] {
-        didSet {
-            let oldCount = oldValue.count
-            let newCount = diskFrameBufferIndex.count
-            diskFrameBufferBytes = diskFrameBufferIndex.values.reduce(into: Int64(0)) { total, entry in
-                total += entry.sizeBytes
-            }
-            if oldCount != newCount {
-                if Self.isVerboseTimelineLoggingEnabled {
-                    Log.debug(
-                        "[Memory] diskFrameBuffer changed: \(oldCount) → \(newCount) frames (\(Self.formatBytes(diskFrameBufferBytes)))",
-                        category: .ui
-                    )
-                }
-            }
-        }
-    }
-    private var diskFrameBufferBytes: Int64 = 0
-    private var diskFrameBufferAccessSequence: UInt64 = 0
+    private var diskFrameBufferIndex = DiskFrameBufferIndex()
+    private var diskFrameBufferBytes: Int64 { diskFrameBufferIndex.totalBytes }
+    /// Frames with a disk-buffer read in progress, refcounted so overlapping reads of the
+    /// same frame stay protected from eviction until the last one finishes.
+    private var inFlightDiskFrameBufferReadCounts: [FrameID: Int] = [:]
+    private var lastDiskFrameBufferCapEvictionLogAt: Date?
+    private var diskFrameBufferCapEvictionsSinceLastLog = 0
     private let diskFrameBufferDirectoryURL: URL
 
     /// Disk buffer hot window policy: keep requests centered around the playhead.
@@ -2408,6 +2489,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let unavailableFrameFallbackSearchRadius = 120
     private static let diskFrameBufferInactivityTTLSeconds: TimeInterval = 60
     private static let diskFrameBufferUnindexedPruneAgeSeconds: TimeInterval = 20 * 60
+    /// Byte ceiling for the on-disk frame buffer while the timeline stays open.
+    /// Matches `SearchViewModel.thumbnailDiskCacheMaxBytes` so the two Library/Caches
+    /// consumers share the same budget.
+    static let diskFrameBufferMaxBytes: Int64 = 512 * 1024 * 1024
+    private static let diskFrameBufferCapEvictionLogIntervalSeconds: TimeInterval = 30
     nonisolated private static let diskFrameBufferFilenameExtension = "jpg"
     private static let inMemoryJPEGFrameCacheCountLimit = 192
     private static let diskFrameBufferMemoryLogIntervalNs: UInt64 = 5_000_000_000
@@ -2958,12 +3044,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         diskFrameBufferTelemetry = DiskFrameBufferTelemetry(intervalStart: now)
     }
 
-    private static func estimatedDiskFrameBufferBytes(_ index: [FrameID: DiskFrameBufferEntry]) -> Int64 {
-        index.values.reduce(into: Int64(0)) { total, entry in
-            total += entry.sizeBytes
-        }
-    }
-
     nonisolated static func timelineDiskFrameBufferDirectoryURL() -> URL {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
@@ -3028,8 +3108,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func initializeDiskFrameBuffer() {
-        diskFrameBufferAccessSequence = 0
-        diskFrameBufferIndex = [:]
+        let previousCount = diskFrameBufferIndex.count
+        diskFrameBufferIndex.removeAll()
+        // In-flight read refcounts are intentionally left alone: their `defer` balances
+        // them, and a read that outlives the reset still deserves eviction protection.
+        logDiskFrameBufferCountChange(from: previousCount)
         diskFrameBufferInitializationTask?.cancel()
 
         let directoryURL = diskFrameBufferDirectoryURL
@@ -3108,12 +3191,83 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func touchDiskFrameBufferEntry(_ frameID: FrameID) {
-        guard var entry = diskFrameBufferIndex[frameID] else { return }
-        diskFrameBufferAccessSequence &+= 1
-        entry.lastAccessSequence = diskFrameBufferAccessSequence
-        diskFrameBufferIndex[frameID] = entry
+        diskFrameBufferIndex.touch(frameID)
         // Keep hot-path access tracking in-memory only.
         // Writing file metadata here adds synchronous filesystem churn during scrub.
+    }
+
+    private func logDiskFrameBufferCountChange(from previousCount: Int) {
+        guard Self.isVerboseTimelineLoggingEnabled else { return }
+        let newCount = diskFrameBufferIndex.count
+        guard previousCount != newCount else { return }
+        Log.debug(
+            "[Memory] diskFrameBuffer changed: \(previousCount) → \(newCount) frames (\(Self.formatBytes(diskFrameBufferBytes)))",
+            category: .ui
+        )
+    }
+
+    private func beginDiskFrameBufferRead(_ frameID: FrameID) {
+        inFlightDiskFrameBufferReadCounts[frameID, default: 0] += 1
+    }
+
+    private func endDiskFrameBufferRead(_ frameID: FrameID) {
+        guard let count = inFlightDiskFrameBufferReadCounts[frameID] else { return }
+        if count <= 1 {
+            inFlightDiskFrameBufferReadCounts.removeValue(forKey: frameID)
+        } else {
+            inFlightDiskFrameBufferReadCounts[frameID] = count - 1
+        }
+    }
+
+    /// Frames the timeline still needs, so eviction can never pull the file out from
+    /// under an in-flight read, the visible frame, or a queued prefetch.
+    private func diskFrameBufferProtectedFrameIDs(alsoProtecting frameID: FrameID?) -> Set<FrameID> {
+        var protectedFrameIDs = Set(inFlightDiskFrameBufferReadCounts.keys)
+        protectedFrameIDs.formUnion(queuedOrInFlightCacheExpansionFrameIDs)
+        if let frameID {
+            protectedFrameIDs.insert(frameID)
+        }
+        if let activeForegroundFrameID {
+            protectedFrameIDs.insert(activeForegroundFrameID)
+        }
+        if let pendingForegroundFrameLoad {
+            protectedFrameIDs.insert(pendingForegroundFrameLoad.timelineFrame.frame.id)
+        }
+        if let currentTimelineFrame {
+            protectedFrameIDs.insert(currentTimelineFrame.frame.id)
+        }
+        return protectedFrameIDs
+    }
+
+    /// Keeps the on-disk frame buffer under `diskFrameBufferMaxBytes` by dropping the
+    /// least recently used timeline-owned frames. Without this the buffer grows for as
+    /// long as the timeline stays open, bounded only by the inactivity TTL clear.
+    private func enforceDiskFrameBufferByteCap(justStored frameID: FrameID?) {
+        guard diskFrameBufferIndex.totalBytes > Self.diskFrameBufferMaxBytes else { return }
+
+        let evictedFrameIDs = diskFrameBufferIndex.evictionCandidates(
+            maxBytes: Self.diskFrameBufferMaxBytes,
+            protecting: diskFrameBufferProtectedFrameIDs(alsoProtecting: frameID)
+        )
+        guard !evictedFrameIDs.isEmpty else { return }
+
+        let bytesBefore = diskFrameBufferIndex.totalBytes
+        let result = removeDiskFrameBufferEntries(evictedFrameIDs, reason: "byte cap")
+
+        // Once the buffer sits at the cap, every stored frame evicts one — throttle the
+        // summary so scrubbing does not turn into per-frame synchronous log writes.
+        diskFrameBufferCapEvictionsSinceLastLog += result.removedFromIndex
+        let now = Date()
+        if let lastLoggedAt = lastDiskFrameBufferCapEvictionLogAt,
+           now.timeIntervalSince(lastLoggedAt) < Self.diskFrameBufferCapEvictionLogIntervalSeconds {
+            return
+        }
+        lastDiskFrameBufferCapEvictionLogAt = now
+        Log.info(
+            "[Timeline-DiskBuffer] Byte cap eviction removedSinceLastLog=\(diskFrameBufferCapEvictionsSinceLastLog) removedNow=\(result.removedFromIndex) removedFromDisk=\(result.removedFromDisk) bytes=\(bytesBefore)→\(diskFrameBufferIndex.totalBytes) cap=\(Self.diskFrameBufferMaxBytes)",
+            category: .ui
+        )
+        diskFrameBufferCapEvictionsSinceLastLog = 0
     }
 
     @discardableResult
@@ -3127,9 +3281,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         var removedFromIndex = 0
         var removedFromDisk = 0
         var preservedExternal = 0
+        let previousCount = diskFrameBufferIndex.count
         removeInMemoryJPEGFrameData(frameIDs)
         for frameID in frameIDs {
-            if let entry = diskFrameBufferIndex.removeValue(forKey: frameID) {
+            if let entry = diskFrameBufferIndex.remove(frameID) {
                 removedFromIndex += 1
                 let shouldRemoveFile = removeExternalFiles || entry.origin == .timelineManaged
                 if shouldRemoveFile {
@@ -3141,6 +3296,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
+        logDiskFrameBufferCountChange(from: previousCount)
         if Self.isVerboseTimelineLoggingEnabled {
             Log.info(
                 "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) removedFromDisk=\(removedFromDisk) preservedExternal=\(preservedExternal)",
@@ -3162,7 +3318,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         var removedIndexedFiles = 0
         var removedIndexedFromDisk = 0
         var preservedExternalIndexed = 0
-        let frameIDs = Array(diskFrameBufferIndex.keys)
+        let frameIDs = diskFrameBufferIndex.frameIDs
         if !frameIDs.isEmpty {
             let result = removeDiskFrameBufferEntries(
                 frameIDs,
@@ -3376,6 +3532,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         do {
+            beginDiskFrameBufferRead(frameID)
+            defer { endDiskFrameBufferRead(frameID) }
+
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
@@ -3383,13 +3542,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
             } else {
-                diskFrameBufferAccessSequence &+= 1
-                diskFrameBufferIndex[frameID] = DiskFrameBufferEntry(
+                let previousCount = diskFrameBufferIndex.count
+                diskFrameBufferIndex.insert(
+                    frameID: frameID,
                     fileURL: fileURL,
                     sizeBytes: Int64(data.count),
-                    lastAccessSequence: diskFrameBufferAccessSequence,
                     origin: .externalCapture
                 )
+                logDiskFrameBufferCountChange(from: previousCount)
+                enforceDiskFrameBufferByteCap(justStored: frameID)
             }
 
             storeInMemoryJPEGFrameData(data, frameID: frameID)
@@ -3412,14 +3573,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try data.write(to: fileURL, options: [.atomic])
             }.value
 
-            diskFrameBufferAccessSequence &+= 1
-            let entry = DiskFrameBufferEntry(
+            let previousCount = diskFrameBufferIndex.count
+            diskFrameBufferIndex.insert(
+                frameID: frameID,
                 fileURL: fileURL,
                 sizeBytes: Int64(data.count),
-                lastAccessSequence: diskFrameBufferAccessSequence,
                 origin: .timelineManaged
             )
-            diskFrameBufferIndex[frameID] = entry
+            logDiskFrameBufferCountChange(from: previousCount)
+            enforceDiskFrameBufferByteCap(justStored: frameID)
             storeInMemoryJPEGFrameData(data, frameID: frameID)
 
         } catch {
