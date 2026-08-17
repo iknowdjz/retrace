@@ -188,6 +188,10 @@ private actor FailingRewriteStorage: StorageProtocol, RewriteAttemptCountingStor
     }
 }
 
+private struct RewriteTestTimeout: Error {
+    let stage: String
+}
+
 private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingStorage {
     private var rewriteAttemptCount = 0
     private var firstRewriteStarted = false
@@ -402,7 +406,9 @@ final class RewriteRetryPolicyTests: XCTestCase {
         let firstRewriteTask = Task {
             try await blockingQueue.processPendingRewrites(for: fixture.videoID.value)
         }
-        await blockingStorage.waitForFirstRewriteToStart()
+        try await withTestTimeout("first rewrite to start") {
+            await blockingStorage.waitForFirstRewriteToStart()
+        }
 
         let secondFrameID = try await insertFrameReference(
             segmentID: fixture.segmentID,
@@ -423,11 +429,17 @@ final class RewriteRetryPolicyTests: XCTestCase {
             rewritePurpose: "redaction"
         )
 
-        let deferredOutcome = try await blockingQueue.processPendingRewrites(for: fixture.videoID.value)
+        let deferredOutcome = try await withTestTimeout(
+            "second processPendingRewrites to return .deferred(.rewriteAlreadyInProgress)"
+        ) {
+            try await blockingQueue.processPendingRewrites(for: fixture.videoID.value)
+        }
         XCTAssertEqual(deferredOutcome, .deferred(.rewriteAlreadyInProgress))
 
         await blockingStorage.releaseFirstRewrite()
-        let firstRewriteOutcome = try await firstRewriteTask.value
+        let firstRewriteOutcome = try await withTestTimeout("first rewrite task to finish") {
+            try await firstRewriteTask.value
+        }
         XCTAssertEqual(firstRewriteOutcome, .completed)
 
         try await waitForRewriteAttemptCount(2, in: blockingStorage)
@@ -437,6 +449,38 @@ final class RewriteRetryPolicyTests: XCTestCase {
         )
         XCTAssertEqual(statuses[firstFrameID.value], FrameProcessingStatus.rewriteCompleted.rawValue)
         XCTAssertEqual(statuses[secondFrameID.value], FrameProcessingStatus.rewriteCompleted.rawValue)
+    }
+
+    /// Bounds an await that would otherwise hang the whole test process.
+    ///
+    /// `swift test` has no per-test timeout, so a suspension that never resumes takes
+    /// the entire run with it — one stuck test made the full suite unrunnable rather
+    /// than merely red. This converts that into a named failure at the exact stage
+    /// that stalled.
+    private func withTestTimeout<T: Sendable>(
+        _ stage: String,
+        seconds: Double = 20,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T?.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(seconds), clock: .continuous)
+                return nil
+            }
+
+            defer { group.cancelAll() }
+            while let result = try await group.next() {
+                if let result {
+                    return result
+                }
+                XCTFail("Timed out after \(seconds)s waiting for: \(stage)", file: file, line: line)
+                throw RewriteTestTimeout(stage: stage)
+            }
+            throw RewriteTestTimeout(stage: stage)
+        }
     }
 
     private func waitForRewriteAttemptCount<Storage: RewriteAttemptCountingStorage>(
