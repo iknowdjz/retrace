@@ -27,7 +27,9 @@ final class ProcessCPUMonitor: ObservableObject {
     private static let snapshotWindowDuration: TimeInterval = 12 * 60 * 60
     private static let idleWarmWindowDuration: TimeInterval = 60
 
-    private init() {}
+    private init() {
+        ProcessCPULegacyLogCleanup.scheduleStartupCleanup()
+    }
 
     func start() {
         guard samplingTask == nil else { return }
@@ -175,7 +177,68 @@ private actor SamplerRequestGate {
     }
 }
 
-private actor ProcessCPULogSampler {
+/// Reclaims `cpu_process_usage.jsonl`, the retired per-sample CPU log.
+///
+/// The sampler used to append one JSON line per tick, but nothing ever read the file back: the live
+/// System Monitor is served from the in-memory tally and `cpu_process_usage_tally.json`, and the only
+/// reader that existed (`rebuildWindowStateFromLog`) was never called. The declared 7-day retention was
+/// never called either, so long-running installs accumulate the file without bound — several GB is
+/// typical after a few months. The write is gone; this removes what earlier builds left behind.
+enum ProcessCPULegacyLogCleanup {
+    static let legacyLogFileName = "cpu_process_usage.jsonl"
+
+    static func logsDirectoryURL() -> URL {
+        URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+            .appendingPathComponent("logs", isDirectory: true)
+    }
+
+    static func legacyLogFileURL(in directoryURL: URL = ProcessCPULegacyLogCleanup.logsDirectoryURL()) -> URL {
+        directoryURL.appendingPathComponent(legacyLogFileName, isDirectory: false)
+    }
+
+    /// Deletes the retired log if it is still on disk and reports how many bytes that freed.
+    ///
+    /// Cheap enough to call on every launch — once the file is gone this is a single `stat` — which also
+    /// covers installs that restore an old file from backup or downgrade and upgrade again.
+    @discardableResult
+    static func removeLegacyLogIfPresent(
+        at fileURL: URL = ProcessCPULegacyLogCleanup.legacyLogFileURL(),
+        fileManager: FileManager = .default
+    ) -> UInt64 {
+        guard fileManager.fileExists(atPath: fileURL.path) else { return 0 }
+
+        let reclaimedBytes = (try? fileManager.attributesOfItem(atPath: fileURL.path))
+            .flatMap { $0[.size] as? NSNumber }?
+            .uint64Value ?? 0
+
+        do {
+            try fileManager.removeItem(at: fileURL)
+        } catch {
+            Log.warning("[ProcessMonitor] Failed to remove retired CPU usage log: \(error)", category: .ui)
+            return 0
+        }
+
+        return reclaimedBytes
+    }
+
+    /// Schedules the reclamation off the main thread. Called once per process from `ProcessCPUMonitor.init`.
+    static func scheduleStartupCleanup() {
+        Task.detached(priority: .background) {
+            let reclaimedBytes = removeLegacyLogIfPresent()
+            guard reclaimedBytes > 0 else { return }
+
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .binary
+            let formattedBytes = formatter.string(fromByteCount: Int64(min(reclaimedBytes, UInt64(Int64.max))))
+            Log.info(
+                "[ProcessMonitor] Removed retired CPU usage log \(legacyLogFileName) (reclaimed \(formattedBytes) / \(reclaimedBytes) bytes)",
+                category: .ui
+            )
+        }
+    }
+}
+
+actor ProcessCPULogSampler {
     private typealias ProcPidRusageFunction = @convention(c) (pid_t, Int32, UnsafeMutableRawPointer?) -> Int32
 
     private struct ProcessIdentity {
@@ -418,21 +481,17 @@ private actor ProcessCPULogSampler {
         var buckets: [ProcessTallyBucket]
     }
 
-    private static let logRetentionDuration: TimeInterval = 7 * 24 * 60 * 60
-    private static let logCompactionInterval: TimeInterval = 12 * 60 * 60
     private static let displayNamePersistInterval: TimeInterval = 30
     private static let tallyPersistInterval: TimeInterval = 5
     private static let tallyBucketDurationSeconds: TimeInterval = 60
     private static let tallyVersion = 3
     private static let memoryCompositionLogInterval: TimeInterval = 30
-    private static let logReadChunkSize = 64 * 1024
     private static let nanosecondUnit = "ns"
     private static let acceptedSampleGapMultiplier: TimeInterval = 4.0
     private static let minimumAcceptedSampleGapSeconds: TimeInterval = 4.0
     private static let memoryCompositionLoggingDefaultsKey = "retrace.debug.processMonitorMemoryCompositionLoggingEnabled"
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerSamplerStateTag = "ui.systemMonitor.samplerWindow"
-    private static let memoryLedgerLogFileTag = "ui.systemMonitor.cpuProcessLogFile"
     private static let memoryLedgerTallyFileTag = "ui.systemMonitor.tallyFile"
     private static let memoryLedgerUnattributedComponentTag = "memory.unattributed.total"
     private static let warmHistoryWindowDuration: TimeInterval = 60
@@ -476,7 +535,6 @@ private actor ProcessCPULogSampler {
     private var displayNameMapDirty = false
     private var lastDisplayNamePersistDate: Date?
     private var retraceGroupKey: String?
-    private var lastCompactionDate: Date?
     private var lastMemoryCompositionLogDate: Date?
     private let retraceBundleID: String
     private let retraceDisplayName: String
@@ -510,21 +568,21 @@ private actor ProcessCPULogSampler {
     private var latestTallySampleTimestamp: TimeInterval?
     private var tallyState: ProcessTallyState?
     private var lastTallyPersistDate: Date?
-    private let logFileURL: URL
+    /// Retired per-sample JSONL log. Nothing reads or writes it any more; the sampler only keeps the
+    /// URL so `clearLogAndState()` can reclaim a file left behind by an older build.
+    private let legacyLogFileURL: URL
     private let tallyFileURL: URL
     private let displayNamesFileURL: URL
     private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
 
-    init() {
+    init(logsDirectoryURL: URL = ProcessCPULegacyLogCleanup.logsDirectoryURL()) {
         retraceBundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
         retraceDisplayName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
             ?? "Retrace"
-        logFileURL = Self.makeLogFileURL()
-        tallyFileURL = Self.makeTallyFileURL()
-        displayNamesFileURL = Self.makeDisplayNamesFileURL()
-        Self.ensureLogFileExists(at: logFileURL)
+        legacyLogFileURL = ProcessCPULegacyLogCleanup.legacyLogFileURL(in: logsDirectoryURL)
+        tallyFileURL = logsDirectoryURL.appendingPathComponent("cpu_process_usage_tally.json", isDirectory: false)
+        displayNamesFileURL = logsDirectoryURL.appendingPathComponent("cpu_process_groups.json", isDirectory: false)
         Self.ensureLogFileExists(at: tallyFileURL)
         groupDisplayNameByKey = Self.readGroupDisplayNameMap(from: displayNamesFileURL)
         tallyState = Self.readTallyState(from: tallyFileURL)
@@ -703,9 +761,7 @@ private actor ProcessCPULogSampler {
                         memoryLedgerComponentCategories: memoryLedgerComponentCategories.isEmpty ? nil : memoryLedgerComponentCategories,
                         groupDisplayNames: nil
                     )
-                    let compactedEntry = compactEntryForStorage(entry)
-                    appendLogEntry(compactedEntry)
-                    appendedEntry = compactedEntry
+                    appendedEntry = compactEntryForStorage(entry)
                 }
             } else if !groupResidentBytes.isEmpty {
                 // Recover quickly after long scheduling gaps by appending a memory-only heartbeat.
@@ -724,9 +780,7 @@ private actor ProcessCPULogSampler {
                     memoryLedgerComponentCategories: memoryLedgerComponentCategories.isEmpty ? nil : memoryLedgerComponentCategories,
                     groupDisplayNames: nil
                 )
-                let compactedEntry = compactEntryForStorage(entry)
-                appendLogEntry(compactedEntry)
-                appendedEntry = compactedEntry
+                appendedEntry = compactEntryForStorage(entry)
             }
         }
 
@@ -1428,22 +1482,6 @@ private actor ProcessCPULogSampler {
         }
     }
 
-    private func rebuildWindowStateFromLog(windowDuration: TimeInterval, now: Date) {
-        loadedWindowDuration = windowDuration
-        clearWindowState(keepingCapacity: true)
-        lastWindowDownsampleDate = nil
-
-        let cutoffTimestamp = now.addingTimeInterval(-windowDuration).timeIntervalSince1970
-        streamLogEntries { entry in
-            guard entry.timestamp >= cutoffTimestamp else { return }
-            appendEntryToWindowState(entry)
-        }
-
-        maybeDownsampleWindowState(at: now)
-        windowStateNeedsReload = false
-        maybePersistDisplayNameMap(at: now)
-    }
-
     private func maybeDownsampleWindowState(at now: Date) {
         guard windowEntries.count >= Self.downsampleMinimumEntries else { return }
         if let lastWindowDownsampleDate,
@@ -2138,7 +2176,6 @@ private actor ProcessCPULogSampler {
         let avgResidentPairs = entryCount > 0
             ? Double(windowTotalResidentPairs) / Double(entryCount)
             : 0
-        let logFileSizeBytes = Self.fileSizeBytes(at: logFileURL)
         let tallyFileSizeBytes = Self.fileSizeBytes(at: tallyFileURL)
         let displayNameMapSize = groupDisplayNameByKey.count
         let samplerStateBytes = Self.estimatedSamplerStateBytes(
@@ -2156,7 +2193,7 @@ private actor ProcessCPULogSampler {
         )
 
         Log.info(
-            "[ProcessMonitor-Memory] snapshotActive=\(shouldBuildSnapshot) footprint=\(Self.formatBytes(snapshot?.physFootprintBytes ?? 0)) resident=\(Self.formatBytes(snapshot?.residentBytes ?? 0)) internal=\(Self.formatBytes(snapshot?.internalBytes ?? 0)) compressed=\(Self.formatBytes(snapshot?.compressedBytes ?? 0)) windowEntries=\(entryCount) windowDuration=\(String(format: "%.1fs", windowTotalDuration)) deltaPairs=\(windowTotalDeltaPairs) avgDeltaPairs=\(String(format: "%.1f", avgDeltaPairs)) energyPairs=\(windowTotalEnergyPairs) avgEnergyPairs=\(String(format: "%.1f", avgEnergyPairs)) residentPairs=\(windowTotalResidentPairs) avgResidentPairs=\(String(format: "%.1f", avgResidentPairs)) cpuGroups=\(windowCumulativeByGroup.count) memoryGroups=\(windowMemoryIntegralByteSecondsByGroup.count) displayNames=\(displayNameMapSize) logSize=\(Self.formatBytes(logFileSizeBytes)) tallySize=\(Self.formatBytes(tallyFileSizeBytes))",
+            "[ProcessMonitor-Memory] snapshotActive=\(shouldBuildSnapshot) footprint=\(Self.formatBytes(snapshot?.physFootprintBytes ?? 0)) resident=\(Self.formatBytes(snapshot?.residentBytes ?? 0)) internal=\(Self.formatBytes(snapshot?.internalBytes ?? 0)) compressed=\(Self.formatBytes(snapshot?.compressedBytes ?? 0)) windowEntries=\(entryCount) windowDuration=\(String(format: "%.1fs", windowTotalDuration)) deltaPairs=\(windowTotalDeltaPairs) avgDeltaPairs=\(String(format: "%.1f", avgDeltaPairs)) energyPairs=\(windowTotalEnergyPairs) avgEnergyPairs=\(String(format: "%.1f", avgEnergyPairs)) residentPairs=\(windowTotalResidentPairs) avgResidentPairs=\(String(format: "%.1f", avgResidentPairs)) cpuGroups=\(windowCumulativeByGroup.count) memoryGroups=\(windowMemoryIntegralByteSecondsByGroup.count) displayNames=\(displayNameMapSize) tallySize=\(Self.formatBytes(tallyFileSizeBytes))",
             category: .ui
         )
 
@@ -2176,16 +2213,6 @@ private actor ProcessCPULogSampler {
             note: "estimated"
         )
         MemoryLedger.set(
-            tag: Self.memoryLedgerLogFileTag,
-            bytes: Int64(min(logFileSizeBytes, UInt64(Int64.max))),
-            count: nil,
-            unit: nil,
-            function: "ui.system_monitor",
-            kind: "telemetry-disk",
-            note: "on-disk",
-            countsTowardTrackedMemory: false
-        )
-        MemoryLedger.set(
             tag: Self.memoryLedgerTallyFileTag,
             bytes: Int64(min(tallyFileSizeBytes, UInt64(Int64.max))),
             count: nil,
@@ -2202,92 +2229,8 @@ private actor ProcessCPULogSampler {
         )
     }
 
-    private func maybeCompactLog(at now: Date) {
-        if let lastCompactionDate, now.timeIntervalSince(lastCompactionDate) < Self.logCompactionInterval {
-            return
-        }
-
-        let started = Date()
-        let retentionCutoff = now.addingTimeInterval(-Self.logRetentionDuration).timeIntervalSince1970
-        var retainedEntries: [CPULogEntry] = []
-        streamLogEntries { entry in
-            if entry.timestamp >= retentionCutoff {
-                retainedEntries.append(compactEntryForStorage(entry))
-            }
-        }
-        rewriteLog(with: retainedEntries)
-        lastCompactionDate = now
-        let elapsedMs = Date().timeIntervalSince(started) * 1000
-        Log.info(
-            "[ProcessMonitor] Log compaction completed in \(String(format: "%.0f", elapsedMs))ms (retainedEntries=\(retainedEntries.count), logSize=\(Self.formatBytes(Self.fileSizeBytes(at: logFileURL))))",
-            category: .ui
-        )
-    }
-
-    private func appendLogEntry(_ entry: CPULogEntry) {
-        do {
-            Self.ensureLogFileExists(at: logFileURL)
-            let encodedEntry = try encoder.encode(entry)
-            let handle = try FileHandle(forWritingTo: logFileURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: encodedEntry)
-            try handle.write(contentsOf: Data([0x0A]))
-        } catch {
-            Log.warning("[SettingsView] Failed to append CPU usage log entry: \(error)", category: .ui)
-        }
-    }
-
-    private func streamLogEntries(_ consume: (CPULogEntry) -> Void) {
-        guard FileManager.default.fileExists(atPath: logFileURL.path) else { return }
-
-        do {
-            let handle = try FileHandle(forReadingFrom: logFileURL)
-            defer { try? handle.close() }
-
-            var pending = Data()
-            while let chunk = try handle.read(upToCount: Self.logReadChunkSize), !chunk.isEmpty {
-                pending.append(chunk)
-
-                var scanIndex = pending.startIndex
-                while let newlineIndex = pending[scanIndex...].firstIndex(of: 0x0A) {
-                    let lineData = Data(pending[scanIndex..<newlineIndex])
-                    if !lineData.isEmpty, let entry = try? decoder.decode(CPULogEntry.self, from: lineData) {
-                        consume(entry)
-                    }
-                    scanIndex = pending.index(after: newlineIndex)
-                }
-
-                if scanIndex > pending.startIndex {
-                    pending.removeSubrange(..<scanIndex)
-                }
-            }
-
-            if !pending.isEmpty, let entry = try? decoder.decode(CPULogEntry.self, from: pending) {
-                consume(entry)
-            }
-        } catch {
-            Log.warning("[SettingsView] Failed to stream CPU usage log file: \(error)", category: .ui)
-        }
-    }
-
-    private func rewriteLog(with entries: [CPULogEntry]) {
-        do {
-            Self.ensureLogFileExists(at: logFileURL)
-            var output = Data()
-            for entry in entries {
-                let encoded = try encoder.encode(entry)
-                output.append(encoded)
-                output.append(0x0A)
-            }
-            try output.write(to: logFileURL, options: .atomic)
-        } catch {
-            Log.warning("[SettingsView] Failed to compact CPU usage log file: \(error)", category: .ui)
-        }
-    }
-
     private func clearLogAndState() {
-        rewriteLog(with: [])
+        ProcessCPULegacyLogCleanup.removeLegacyLogIfPresent(at: legacyLogFileURL)
         clearTallyStateFile()
         tallyState = nil
         lastTallyPersistDate = nil
@@ -2309,7 +2252,6 @@ private actor ProcessCPULogSampler {
         latestResidentBytesByRetraceChild = [:]
         latestTallySampleTimestamp = nil
         retraceGroupKey = nil
-        lastCompactionDate = nil
         lastMemoryCompositionLogDate = nil
     }
 
@@ -3153,27 +3095,6 @@ private actor ProcessCPULogSampler {
         } catch {
             Log.warning("[SettingsView] Failed to create CPU usage log directory: \(error)", category: .ui)
         }
-    }
-
-    private static func makeLogFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
-        return rootURL
-            .appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("cpu_process_usage.jsonl", isDirectory: false)
-    }
-
-    private static func makeTallyFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
-        return rootURL
-            .appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("cpu_process_usage_tally.json", isDirectory: false)
-    }
-
-    private static func makeDisplayNamesFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
-        return rootURL
-            .appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("cpu_process_groups.json", isDirectory: false)
     }
 
     private static func listAllProcessIDs() -> [pid_t] {
