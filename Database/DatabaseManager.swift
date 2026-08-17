@@ -4063,6 +4063,95 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
+    /// Enqueues many frames in one transaction using a single prepared statement.
+    ///
+    /// Returns the number of frames actually enqueued.
+    ///
+    /// Frames that are not eligible (processingStatus != 0 — typically already
+    /// processed) are skipped rather than reported as an error. This differs
+    /// deliberately from `enqueueFrameForProcessing`, which throws for them: callers
+    /// enqueueing a batch by calling that in a loop abandoned every remaining frame
+    /// the moment one ineligible frame appeared. On the startup recovery path
+    /// (AppCoordinator's RecoveryManager callback) that meant a single already-
+    /// processed frame silently prevented every frame after it from being queued for
+    /// OCR at all — their text never became searchable.
+    public func enqueueFramesForProcessing(frameIDs: [Int64], priority: Int = 0) async throws -> Int {
+        guard !frameIDs.isEmpty else { return 0 }
+
+        return try withTracedDatabaseOperation("enqueue_frames_for_processing") { db in
+            // Only open a transaction if this call actually owns the connection.
+            //
+            // enqueueFrameForProcessing (the per-frame call this replaces) opened no
+            // transaction at all, so callers were free to invoke it from inside one.
+            // At least one does: the rewrite drain re-enqueues crashed frames while a
+            // rewrite is in flight. Unconditionally issuing BEGIN IMMEDIATE there
+            // deadlocks against the transaction already held on this connection —
+            // RewriteRetryPolicyTests.testDeferredRewriteForActiveVideoRedrainsAfter\
+            // CurrentRewriteFinishes hangs outright. Nesting must therefore join the
+            // caller's transaction and let the caller commit it.
+            let ownsTransaction = sqlite3_get_autocommit(db) != 0
+            var transactionOpen = false
+            do {
+                if ownsTransaction {
+                    try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+                    transactionOpen = true
+                }
+
+                let sql = """
+                    INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount)
+                    SELECT ?, ?, ?, 0
+                    FROM frame
+                    WHERE id = ? AND processingStatus = 0;
+                """
+
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+
+                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                    throw DatabaseError.queryFailed(
+                        query: sql,
+                        underlying: String(cString: sqlite3_errmsg(db))
+                    )
+                }
+
+                let enqueuedAt = Date().timeIntervalSince1970
+                var enqueued = 0
+
+                for frameID in frameIDs {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    sqlite3_bind_int64(stmt, 1, frameID)
+                    sqlite3_bind_double(stmt, 2, enqueuedAt)
+                    sqlite3_bind_int(stmt, 3, Int32(priority))
+                    sqlite3_bind_int64(stmt, 4, frameID)
+
+                    guard sqlite3_step(stmt) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(
+                            query: sql,
+                            underlying: String(cString: sqlite3_errmsg(db))
+                        )
+                    }
+
+                    enqueued += Int(sqlite3_changes(db))
+                }
+
+                if transactionOpen {
+                    try executeImmediateSQL("COMMIT;", db: db)
+                    transactionOpen = false
+                }
+                return enqueued
+            } catch {
+                // Only roll back a transaction this call opened. Rolling back a
+                // caller's transaction would discard work that has nothing to do
+                // with enqueueing.
+                if transactionOpen {
+                    try? executeImmediateSQL("ROLLBACK;", db: db)
+                }
+                throw error
+            }
+        }
+    }
+
     /// Dequeue the next frame for processing (highest priority, oldest first)
     /// Atomically removes it from the queue and marks processingStatus = 1.
     /// Returns tuple of (queueID, frameID, retryCount) or nil if queue is empty

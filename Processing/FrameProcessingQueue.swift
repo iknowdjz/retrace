@@ -989,9 +989,25 @@ public actor FrameProcessingQueue {
     }
 
     /// Enqueue multiple frames (batch operation)
+    ///
+    /// One transaction and one prepared statement for the whole batch, rather than
+    /// one of each per frame. Ineligible frames are skipped instead of aborting the
+    /// batch — see DatabaseManager.enqueueFramesForProcessing for why that matters on
+    /// the recovery path.
     public func enqueueBatch(frameIDs: [Int64], priority: Int = 0) async throws {
-        for frameID in frameIDs {
-            try await enqueue(frameID: frameID, priority: priority)
+        guard !frameIDs.isEmpty else { return }
+
+        let enqueued = try await databaseManager.enqueueFramesForProcessing(
+            frameIDs: frameIDs,
+            priority: priority
+        )
+        currentQueueDepth += enqueued
+
+        if enqueued < frameIDs.count {
+            Log.info(
+                "[Queue] Enqueued \(enqueued) of \(frameIDs.count) frames; \(frameIDs.count - enqueued) were already processed",
+                category: .processing
+            )
         }
     }
 
