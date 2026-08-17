@@ -610,6 +610,55 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getByID(db: db, id: id)
     }
 
+    /// Looks up the owning segment for many frames in one query.
+    ///
+    /// Search result construction needs only the segment each matched frame belongs
+    /// to, but fetched it with `getFrame` per match — one round trip and one full row
+    /// hydration per result row. Frames that no longer exist are simply absent from
+    /// the returned map, so callers can keep skipping results whose frame is gone.
+    public func getSegmentIDsForFrames(ids: [FrameID]) async throws -> [FrameID: AppSegmentID] {
+        guard !ids.isEmpty else { return [:] }
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        var segmentIDsByFrameID: [FrameID: AppSegmentID] = [:]
+        segmentIDsByFrameID.reserveCapacity(ids.count)
+
+        // Chunked to stay well clear of SQLite's bound-variable ceiling.
+        let chunkSize = 500
+        var offset = 0
+        while offset < ids.count {
+            let chunk = Array(ids[offset..<min(offset + chunkSize, ids.count)])
+            offset += chunkSize
+
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            let sql = "SELECT id, segmentId FROM frame WHERE id IN (\(placeholders));"
+
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: sql,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            for (index, frameID) in chunk.enumerated() {
+                sqlite3_bind_int64(statement, Int32(index + 1), frameID.value)
+            }
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let frameID = FrameID(value: sqlite3_column_int64(statement, 0))
+                let segmentID = AppSegmentID(value: sqlite3_column_int64(statement, 1))
+                segmentIDsByFrameID[frameID] = segmentID
+            }
+        }
+
+        return segmentIDsByFrameID
+    }
+
     public func getFrames(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameReference] {
         try withTracedDatabaseOperation("get_frames_time_range") { db in
             try FrameQueries.getByTimeRange(db: db, from: startDate, to: endDate, limit: limit)

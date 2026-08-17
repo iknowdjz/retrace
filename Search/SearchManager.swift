@@ -108,11 +108,18 @@ public actor SearchManager: SearchProtocol {
             offset: query.offset
         )
 
+        // Resolve every matched frame's segment in one query rather than one per
+        // match. Only the segment is needed here, and a page of results previously
+        // cost a database round trip per row.
+        let segmentIDsByFrameID = try await database.getSegmentIDsForFrames(
+            ids: ftsMatches.map(\.frameID)
+        )
+
         // Convert FTS matches to SearchResults
         var results: [SearchResult] = []
         for match in ftsMatches {
-            // Get frame reference to get segment info
-            if let frame = try await database.getFrame(id: match.frameID) {
+            // A match whose frame has since been deleted is skipped, as before.
+            if let segmentID = segmentIDsByFrameID[match.frameID] {
                 // ⚠️ RELEASE 2 ONLY - Use simple matched text extraction for Release 1
                 let matchedText = match.snippet.components(separatedBy: " ").prefix(5).joined(separator: " ")
 
@@ -130,7 +137,7 @@ public actor SearchManager: SearchProtocol {
                         windowName: match.windowName,
                         browserURL: nil
                     ),
-                    segmentID: frame.segmentID,
+                    segmentID: segmentID,
                     videoID: match.videoID,
                     frameIndex: match.frameIndex
                 )

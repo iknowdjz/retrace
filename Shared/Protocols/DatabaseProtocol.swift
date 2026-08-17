@@ -25,6 +25,13 @@ public protocol DatabaseProtocol: Actor {
     /// Get a frame by ID
     func getFrame(id: FrameID) async throws -> FrameReference?
 
+    /// Look up the owning segment for many frames at once.
+    ///
+    /// Frames that no longer exist are absent from the returned map, so callers can
+    /// skip results whose frame has been deleted. A default implementation falls back
+    /// to `getFrame` per id; `DatabaseManager` overrides it with a single query.
+    func getSegmentIDsForFrames(ids: [FrameID]) async throws -> [FrameID: AppSegmentID]
+
     /// Get frames in a time range
     func getFrames(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameReference]
 
@@ -468,5 +475,20 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
             encryptedText: encryptedText,
             isRedacted: isRedacted
         )
+    }
+}
+
+public extension DatabaseProtocol {
+    /// Correctness-preserving fallback for conformers that have no batched query.
+    /// Same observable result as the batched form, one round trip per id.
+    func getSegmentIDsForFrames(ids: [FrameID]) async throws -> [FrameID: AppSegmentID] {
+        var segmentIDsByFrameID: [FrameID: AppSegmentID] = [:]
+        segmentIDsByFrameID.reserveCapacity(ids.count)
+        for id in ids {
+            if let frame = try await getFrame(id: id) {
+                segmentIDsByFrameID[id] = frame.segmentID
+            }
+        }
+        return segmentIDsByFrameID
     }
 }

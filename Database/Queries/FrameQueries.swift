@@ -1215,9 +1215,35 @@ public enum FrameQueries {
         }
 
         do {
+            // Prepared once for the whole purge rather than once per frame. A
+            // retention pass deletes frames in bulk, so re-parsing this for every
+            // frame was pure overhead on top of the per-frame FTS deletion.
+            let deleteSQL = "DELETE FROM frame WHERE id = ?;"
+            var deleteStatement: OpaquePointer?
+            defer {
+                sqlite3_finalize(deleteStatement)
+            }
+
+            guard sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: deleteSQL,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
             for frameID in frameIDs {
                 try FTSQueries.deleteForFrame(db: db, frameId: frameID)
-                try deleteFrameRow(db: db, frameID: frameID)
+
+                sqlite3_reset(deleteStatement)
+                sqlite3_clear_bindings(deleteStatement)
+                sqlite3_bind_int64(deleteStatement, 1, frameID)
+
+                guard sqlite3_step(deleteStatement) == SQLITE_DONE else {
+                    throw DatabaseError.queryFailed(
+                        query: deleteSQL,
+                        underlying: String(cString: sqlite3_errmsg(db))
+                    )
+                }
             }
 
             if managesOwnTransaction {
@@ -1231,30 +1257,6 @@ public enum FrameQueries {
         }
 
         return frameIDs.count
-    }
-
-    private static func deleteFrameRow(db: OpaquePointer, frameID: Int64) throws {
-        let sql = "DELETE FROM frame WHERE id = ?;"
-        var statement: OpaquePointer?
-        defer {
-            sqlite3_finalize(statement)
-        }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(statement, 1, frameID)
-
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
     }
 
     // MARK: - Exists Check
