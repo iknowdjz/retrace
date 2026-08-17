@@ -27,9 +27,7 @@ final class ProcessCPUMonitor: ObservableObject {
     private static let snapshotWindowDuration: TimeInterval = 12 * 60 * 60
     private static let idleWarmWindowDuration: TimeInterval = 60
 
-    private init() {
-        ProcessCPULegacyLogCleanup.scheduleStartupCleanup()
-    }
+    private init() {}
 
     func start() {
         guard samplingTask == nil else { return }

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Retrace watchdog.
+
+  Label kept as io.retrace.app.keepalive so this replaces the previous job in
+  place rather than leaving two watchdogs racing each other.
+
+  Previously this ran, every 10 seconds:
+      pgrep -x Retrace >/dev/null || open -g -j -a /Applications/Retrace.app
+  which only noticed Retrace disappearing, never Retrace running and recording
+  nothing. The script now invoked checks the database for recent frames, gated on
+  recent user input, and rate limits its own restarts.
+
+  Interval is 60s rather than 10s: the previous cadence spawned ~8,640
+  bash+pgrep pairs a day, and nothing here needs ten-second resolution.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.retrace.app.keepalive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/zachmoss/services/retrace-watchdog/watchdog.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/zachmoss/services/retrace-watchdog/watchdog.stderr.log</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+</dict>
+</plist>

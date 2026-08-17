@@ -133,20 +133,50 @@ set_plist_string "RetraceForkName" "$FORK_NAME"
 # Create PkgInfo
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
-echo "✍️  Signing app bundle..."
+# ---------------------------------------------------------------------------
+# Code signing identity
+#
+# Defaults to ad-hoc ("-"), which needs no certificate and is fine for a one-off
+# build. For an app you actually run all day, prefer a stable identity: macOS
+# binds TCC grants (Screen Recording, Accessibility, Automation) to the signing
+# identity, and an ad-hoc signature is identified by its cdhash, which changes on
+# every single rebuild. That means ad-hoc costs you a fresh Screen Recording
+# grant after every build, and until you notice, Retrace records nothing.
+#
+# Any stable identity fixes this — an Apple Development cert or a self-signed
+# code-signing cert from Keychain Access both work. Override with:
+#   RETRACE_CODESIGN_IDENTITY="Apple Development: Your Name (XXXXXXXXXX)" ./build_and_sign.sh
+# List candidates with: security find-identity -v -p codesigning
+# ---------------------------------------------------------------------------
+CODESIGN_IDENTITY="${RETRACE_CODESIGN_IDENTITY:--}"
+
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+    echo "✍️  Signing app bundle (ad-hoc)..."
+    echo "   ⚠️  Ad-hoc signatures change identity on every rebuild, so macOS will"
+    echo "      ask you to re-grant Screen Recording each time. Set"
+    echo "      RETRACE_CODESIGN_IDENTITY to a stable identity to avoid that."
+else
+    echo "✍️  Signing app bundle as: $CODESIGN_IDENTITY"
+    if ! security find-identity -v -p codesigning | grep -qF "$CODESIGN_IDENTITY"; then
+        echo "❌ No valid codesigning identity matching: $CODESIGN_IDENTITY"
+        echo "   Available:"
+        security find-identity -v -p codesigning
+        exit 1
+    fi
+fi
 
 # Sign frameworks first (required before signing the app)
 for fw in "$APP_BUNDLE/Contents/Frameworks/"*.framework; do
-    [ -d "$fw" ] && codesign --force --sign - "$fw"
+    [ -d "$fw" ] && codesign --force --sign "$CODESIGN_IDENTITY" "$fw"
 done
 
 # Sign nested helper executables before the containing app.
 if [ -f "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper" ]; then
-    codesign --force --sign - "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
+    codesign --force --sign "$CODESIGN_IDENTITY" "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
 fi
 
-# Sign the app bundle with ad-hoc signature and entitlements
-codesign --force --deep --sign - --entitlements "UI/Retrace.entitlements" "$APP_BUNDLE"
+# Sign the app bundle with entitlements
+codesign --force --deep --sign "$CODESIGN_IDENTITY" --entitlements "UI/Retrace.entitlements" "$APP_BUNDLE"
 
 echo "✅ Build complete!"
 echo ""

@@ -744,6 +744,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             // Setup power settings change observer
             setupPowerSettingsObserver()
+            // Reclaim the retired cpu_process_usage.jsonl left behind by older
+            // builds. Deliberately invoked here rather than from
+            // ProcessCPUMonitor's initializer: the monitor is a singleton that
+            // unit tests instantiate, and a test must never delete real files out
+            // of the user's Application Support directory.
+            ProcessCPULegacyLogCleanup.scheduleStartupCleanup()
             ProcessCPUMonitor.shared.start()
 
             Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
