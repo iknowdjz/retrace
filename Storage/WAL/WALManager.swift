@@ -32,9 +32,29 @@ public actor WALManager {
     private var frameOffsetIndexCache: [Int64: WALFrameOffsetIndex] = [:]
     private var frameIDOffsetIndexCache: [Int64: WALFrameIDOffsetIndex] = [:]
     private var debugRawReadOffsetsByVideoID: [Int64: [UInt64]] = [:]
+    private var debugMetadataSaveCountByVideoID: [Int64: Int] = [:]
+    /// Appends recorded since the last successful metadata sidecar write, per session.
+    private var appendsSinceMetadataSaveByVideoID: [Int64: Int] = [:]
+    /// Last durable video frontier persisted by `updateDurableVideoState`, per session.
+    /// Callers hold `WALSession` by value and never learn about durable-state updates,
+    /// so appends must re-apply this before rewriting the sidecar or they would
+    /// clobber the frontier recovery relies on.
+    private var durableVideoStateByVideoID: [Int64: WALDurableVideoState] = [:]
     private static let eagerReadSafetyLimitBytes: Int64 = 512 * 1024 * 1024
     private static let discardableQuarantinePrefix = "quarantined_segment_"
     private static let retainedQuarantinePrefix = "retained_segment_"
+
+    /// Routine per-append metadata rewrites are throttled to one write every N appends.
+    ///
+    /// Safe because `metadata.json` is never the source of truth for frame data:
+    /// recovery rebuilds the frame set by scanning `frames.bin` (`recoveryIndex`), and
+    /// `listActiveSessions` reconciles `frameCount` against that scan before handing the
+    /// session to `RecoveryManager`. Everything recovery actually depends on is written
+    /// outside the throttle: `width`/`height` on first set (first append), the durable
+    /// video frontier via `updateDurableVideoState`, and the initial sidecar in
+    /// `createSession`. Segments cap at 150 frames, so a session writes ~6 sidecars
+    /// instead of ~151.
+    private static let metadataSaveAppendInterval = 30
 
     public init(walRoot: URL) {
         self.walRootURL = walRoot
@@ -80,6 +100,9 @@ public actor WALManager {
 
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
 
+        // A recycled videoID must not inherit throttle/durable state from a prior session.
+        clearSessionCaches(videoIDValue: videoID.value)
+
         // Create session directory
         do {
             try FileManager.default.createDirectory(
@@ -112,6 +135,7 @@ public actor WALManager {
         )
         do {
             try saveMetadata(metadata, to: sessionDir)
+            recordMetadataSave(videoIDValue: videoID.value)
         } catch {
             Log.warning(
                 "[WAL] Failed to persist initial metadata sidecar for session \(videoID.value): \(error.localizedDescription)",
@@ -224,24 +248,67 @@ public actor WALManager {
         }
 
         // Update session metadata
+        let videoIDValue = session.videoID.value
         session.metadata.frameCount += 1
+
+        // Recovery reads width/height straight out of the sidecar (to size recovery
+        // batches and to rebuild a video row), so the append that first learns the
+        // frame dimensions always writes through the throttle.
+        var mustSaveMetadata = false
         if session.metadata.width == 0 {
             session.metadata.width = frame.width
             session.metadata.height = frame.height
+            mustSaveMetadata = true
+        }
+        // Keeps the sidecar's `frameCount > 0` the instant any frame exists, which is
+        // what recovery uses to decide "quarantine residue" vs "delete empty session".
+        if session.metadata.frameCount == 1 {
+            mustSaveMetadata = true
         }
 
-        do {
-            try saveMetadata(session.metadata, to: session.sessionDir)
-        } catch {
-            Log.warning(
-                "[WAL] Failed to update metadata sidecar for session \(session.videoID.value): \(error.localizedDescription)",
-                category: .storage
-            )
+        applyPersistedDurableVideoState(to: &session.metadata)
+
+        var pendingAppends = (appendsSinceMetadataSaveByVideoID[videoIDValue] ?? 0) + 1
+        if mustSaveMetadata || pendingAppends >= Self.metadataSaveAppendInterval {
+            do {
+                try saveMetadata(session.metadata, to: session.sessionDir)
+                recordMetadataSave(videoIDValue: videoIDValue)
+                pendingAppends = 0
+            } catch {
+                // Leave the pending counter high so the next append retries immediately
+                // instead of waiting out another full throttle window.
+                Log.warning(
+                    "[WAL] Failed to update metadata sidecar for session \(videoIDValue): \(error.localizedDescription)",
+                    category: .storage
+                )
+            }
         }
+        appendsSinceMetadataSaveByVideoID[videoIDValue] = pendingAppends
 
         // Invalidate frame offset index cache so the next random-access read
         // can rebuild with the newly appended frame.
         frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+    }
+
+    /// Re-apply the durable video frontier this actor last persisted for `metadata`'s session.
+    ///
+    /// `WALSession` is a value type owned by the caller, so a session that was created
+    /// before `updateDurableVideoState` ran still carries zeroed durable fields. Writing
+    /// those back verbatim would erase the frontier that lets recovery trust (and trim to)
+    /// the flushed prefix of the fragmented MP4.
+    private func applyPersistedDurableVideoState(to metadata: inout WALMetadata) {
+        guard let durableState = durableVideoStateByVideoID[metadata.videoID.value] else {
+            return
+        }
+
+        metadata.durableReadableFrameCount = max(
+            metadata.durableReadableFrameCount,
+            durableState.readableFrameCount
+        )
+        metadata.durableVideoFileSizeBytes = max(
+            metadata.durableVideoFileSizeBytes,
+            durableState.videoFileSizeBytes
+        )
     }
 
     /// Persist the readable frontier of the fragmented MP4 so recovery can
@@ -260,6 +327,14 @@ public actor WALManager {
         let nextReadableFrameCount = max(metadata.durableReadableFrameCount, readableFrameCount)
         let nextDurableVideoFileSizeBytes = max(metadata.durableVideoFileSizeBytes, durableVideoFileSizeBytes)
 
+        // Remember the frontier even when the sidecar already carries it, so a later
+        // throttled append rewrite cannot regress these fields back to the stale values
+        // held by the caller's `WALSession` copy.
+        durableVideoStateByVideoID[videoID.value] = WALDurableVideoState(
+            readableFrameCount: nextReadableFrameCount,
+            videoFileSizeBytes: nextDurableVideoFileSizeBytes
+        )
+
         guard nextReadableFrameCount != metadata.durableReadableFrameCount
             || nextDurableVideoFileSizeBytes != metadata.durableVideoFileSizeBytes else {
             return
@@ -268,6 +343,7 @@ public actor WALManager {
         metadata.durableReadableFrameCount = nextReadableFrameCount
         metadata.durableVideoFileSizeBytes = nextDurableVideoFileSizeBytes
         try saveMetadata(metadata, to: sessionDir)
+        recordMetadataSave(videoIDValue: videoID.value)
     }
 
     /// Persist a stable mapping from database frameID -> WAL frame offset.
@@ -401,6 +477,8 @@ public actor WALManager {
 
         frameOffsetIndexCache.removeAll()
         frameIDOffsetIndexCache.removeAll()
+        appendsSinceMetadataSaveByVideoID.removeAll()
+        durableVideoStateByVideoID.removeAll()
     }
 
     /// Delete discardable quarantined WAL sessions older than the provided cutoff date.
@@ -439,8 +517,7 @@ public actor WALManager {
                 removedCount += 1
 
                 if let videoIDValue = quarantinedVideoID(for: dir) {
-                    frameOffsetIndexCache.removeValue(forKey: videoIDValue)
-                    frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
+                    clearSessionCaches(videoIDValue: videoIDValue)
                 }
             } catch {
                 Log.warning(
@@ -504,6 +581,7 @@ public actor WALManager {
                 if let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) {
                     do {
                         try saveMetadata(rebuiltMetadata, to: dir)
+                        recordMetadataSave(videoIDValue: videoID.value)
                     } catch {
                         Log.warning(
                             "[WAL] Rebuilt metadata for session \(videoID.value) but failed to persist repaired sidecar: \(error.localizedDescription)",
@@ -676,6 +754,20 @@ public actor WALManager {
         }
     }
 
+    /// Number of `metadata.json` rewrites this actor has performed for `videoID`.
+    /// Survives `clearSessionCaches` so tests can assert across finalize.
+    func debugMetadataSaveCount(for videoID: VideoSegmentID) -> Int {
+        debugMetadataSaveCountByVideoID[videoID.value] ?? 0
+    }
+
+    func resetDebugMetadataSaveCounts(for videoID: VideoSegmentID? = nil) {
+        if let videoID {
+            debugMetadataSaveCountByVideoID.removeValue(forKey: videoID.value)
+        } else {
+            debugMetadataSaveCountByVideoID.removeAll()
+        }
+    }
+
     /// Rename an active WAL session out of the recovery path so launch can continue.
     /// Retained quarantines are preserved for manual inspection instead of timed cleanup.
     @discardableResult
@@ -703,8 +795,7 @@ public actor WALManager {
         }
 
         try FileManager.default.moveItem(at: session.sessionDir, to: destinationURL)
-        frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
-        frameIDOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        clearSessionCaches(videoIDValue: session.videoID.value)
 
         Log.warning(
             "[WAL] \(disposition.logLabel) session \(session.videoID.value) to \(destinationURL.lastPathComponent): \(reason)",
@@ -1292,6 +1383,12 @@ public actor WALManager {
     private func clearSessionCaches(videoIDValue: Int64) {
         frameOffsetIndexCache.removeValue(forKey: videoIDValue)
         frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
+        appendsSinceMetadataSaveByVideoID.removeValue(forKey: videoIDValue)
+        durableVideoStateByVideoID.removeValue(forKey: videoIDValue)
+    }
+
+    private func recordMetadataSave(videoIDValue: Int64) {
+        debugMetadataSaveCountByVideoID[videoIDValue, default: 0] += 1
     }
 
     private func readOptionalString(
@@ -1392,7 +1489,12 @@ public actor WALManager {
 
         let needsRepair = metadataNeedsRepair(metadata)
         guard needsRepair, let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) else {
-            return metadata
+            return reconcileFrameCount(
+                metadata,
+                videoID: videoID,
+                framesURL: framesURL,
+                framesFileSize: framesFileSize
+            )
         }
 
         var repairedMetadata = rebuiltMetadata
@@ -1401,6 +1503,7 @@ public actor WALManager {
 
         do {
             try saveMetadata(repairedMetadata, to: sessionDir)
+            recordMetadataSave(videoIDValue: videoID.value)
         } catch {
             Log.warning(
                 "[WAL] Repaired stale metadata for session \(videoID.value) but failed to persist rebuilt sidecar: \(error.localizedDescription)",
@@ -1413,6 +1516,45 @@ public actor WALManager {
             category: .storage
         )
         return repairedMetadata
+    }
+
+    /// Bring a healthy sidecar's `frameCount` back in line with what `frames.bin` can
+    /// actually yield.
+    ///
+    /// `appendFrame` throttles sidecar rewrites, so a session that crashed mid-window
+    /// can carry a `frameCount` up to `metadataSaveAppendInterval - 1` frames behind the
+    /// bytes on disk. The recoverable-frame scan is the authority for every consumer that
+    /// matters, so recompute from it here — before `RecoveryManager` ever sees the session.
+    ///
+    /// Deliberately never reconciles down to zero: when nothing is recoverable but the
+    /// sidecar still claims frames, recovery quarantines the residue for inspection rather
+    /// than deleting it, and that signal must survive.
+    private func reconcileFrameCount(
+        _ metadata: WALMetadata,
+        videoID: VideoSegmentID,
+        framesURL: URL,
+        framesFileSize: Int64
+    ) -> WALMetadata {
+        guard let recoverableFrameCount = try? frameOffsets(
+            for: videoID.value,
+            framesURL: framesURL,
+            currentFileSize: framesFileSize
+        ).count else {
+            return metadata
+        }
+
+        guard recoverableFrameCount > 0, recoverableFrameCount != metadata.frameCount else {
+            return metadata
+        }
+
+        Log.debug(
+            "[WAL] Reconciled session \(videoID.value) metadata frameCount \(metadata.frameCount) -> \(recoverableFrameCount) from recoverable WAL frames",
+            category: .storage
+        )
+
+        var reconciled = metadata
+        reconciled.frameCount = recoverableFrameCount
+        return reconciled
     }
 
     private func parseFrameHeader(from data: Data) throws -> WALFrameHeader {
@@ -1556,6 +1698,13 @@ private struct WALFrameHeader {
 private struct WALFrameOffsetIndex {
     let fileSize: Int64
     let offsets: [UInt64]
+}
+
+/// Last durable fMP4 frontier persisted for a session, mirrored in memory so throttled
+/// sidecar rewrites driven by `appendFrame` cannot regress it.
+private struct WALDurableVideoState {
+    let readableFrameCount: Int
+    let videoFileSizeBytes: Int64
 }
 
 struct WALRecoveryIndex: Sendable {
