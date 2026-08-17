@@ -555,6 +555,42 @@ public actor CGWindowListCapture {
         )
     }
 
+    /// Selects the windows to composite into a filtered capture.
+    ///
+    /// Only layer-0 windows are eligible: system windows carry extreme layer values
+    /// (e.g. -2147483601) that make CGWindowListCreateImageFromArray return nil.
+    /// Windows that are fully transparent, offscreen, or explicitly excluded are
+    /// dropped.
+    ///
+    /// Extracted from captureWithFiltering so it can be tested and measured directly —
+    /// it runs on every capture that has any exclusion configured, once per window on
+    /// the machine.
+    static func includedWindowIDs(
+        from windowList: [[String: Any]],
+        excluding excludedWindowIDs: Set<CGWindowID>
+    ) -> [CGWindowID] {
+        var includedWindowIDs: [CGWindowID] = []
+        includedWindowIDs.reserveCapacity(windowList.count)
+
+        for windowInfo in windowList {
+            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
+
+            // Layer 0 = normal application windows.
+            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+            if layer != 0 { continue }
+
+            let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? 0
+            let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
+            if alpha <= 0 || !isOnScreen { continue }
+
+            if !excludedWindowIDs.contains(windowID) {
+                includedWindowIDs.append(windowID)
+            }
+        }
+
+        return includedWindowIDs
+    }
+
     /// Mirrors the sampling grid `FrameDeduplicator.computeSimilarity` derives, so the
     /// proxy contains one pixel per pixel that comparison would have sampled.
     ///
@@ -1129,31 +1165,10 @@ public actor CGWindowListCapture {
         // CRITICAL: Only include windows with layer == 0 (normal app windows)
         // System windows with extreme layer values (e.g., -2147483601) can cause
         // CGWindowListCreateImageFromArray to return nil
-        var includedWindowIDs: [CGWindowID] = []
-
-        for windowInfo in windowList {
-            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
-
-            // Filter out system/desktop/overlay windows by checking layer
-            // Layer 0 = normal application windows
-            // Non-zero layers are typically system windows that can break the API
-            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
-            if layer != 0 {
-                Log.debug("[Filtering] Skipping window \(windowID) with layer \(layer)", category: .capture)
-                continue
-            }
-
-            // Also verify window has valid properties
-            let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? 0
-            let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
-            if alpha <= 0 || !isOnScreen {
-                continue
-            }
-
-            if !excludedWindowIDs.contains(windowID) {
-                includedWindowIDs.append(windowID)
-            }
-        }
+        let includedWindowIDs = Self.includedWindowIDs(
+            from: windowList,
+            excluding: excludedWindowIDs
+        )
 
         // If we filtered everything, capture just desktop
         if includedWindowIDs.isEmpty {
@@ -1163,30 +1178,19 @@ public actor CGWindowListCapture {
 
         let displayBounds = CGDisplayBounds(displayID)
 
-        Log.info("[Filtering] Display bounds: \(displayBounds), displayID: \(displayID)", category: .capture)
-        Log.info("[Filtering] Attempting to capture \(includedWindowIDs.count) windows, excluding \(excludedWindowIDs.count)", category: .capture)
-        Log.info("[Filtering] Included window IDs: \(includedWindowIDs.prefix(10))...", category: .capture)
-        Log.info("[Filtering] Excluded window IDs: \(excludedWindowIDs)", category: .capture)
-
-        // Log details about included windows
-        for windowInfo in windowList {
-            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
-            if includedWindowIDs.contains(windowID) {
-                let name = windowInfo[kCGWindowName as String] as? String ?? "(no name)"
-                let owner = windowInfo[kCGWindowOwnerName as String] as? String ?? "(no owner)"
-                let layer = windowInfo[kCGWindowLayer as String] as? Int ?? -1
-                let bounds = windowInfo[kCGWindowBounds as String] as? [String: Any]
-                let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? -1
-                let onScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
-                Log.debug("[Filtering] Including window \(windowID): '\(name)' from \(owner), layer=\(layer), alpha=\(alpha), onScreen=\(onScreen), bounds=\(bounds ?? [:])", category: .capture)
-            }
-        }
+        // Log.verbose is console-only; Log.info and Log.debug both write a line to
+        // retrace.log, and this runs on every capture that has any exclusion. Swift
+        // interpolation is eager and Log takes a String rather than an autoclosure, so
+        // these messages are built whether or not anything consumes them — keep them to
+        // one summary line rather than four, and off the log file.
+        Log.verbose(
+            "[Filtering] display=\(displayID) bounds=\(displayBounds) including=\(includedWindowIDs.count) excluding=\(excludedWindowIDs.count)",
+            category: .capture
+        )
 
         // Create CFArray of window IDs properly - must be CGWindowID (UInt32) wrapped as NSNumber/CFNumber
         let windowNumbers: [NSNumber] = includedWindowIDs.map { NSNumber(value: $0) }
         let windowArray: CFArray = windowNumbers as CFArray
-
-        Log.info("[Filtering] Created CFArray with \(CFArrayGetCount(windowArray)) elements", category: .capture)
 
         // If we already know array capture is broken on this system, skip straight to fallback
         if arrayCaptureBroken {
