@@ -377,6 +377,60 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         XCTAssertTrue(hasDedupedOutcome)
     }
 
+    /// Every capture must resolve its pending candidate exactly once — materialized if
+    /// kept, discarded if deduplicated. The backend holds the captured image until one
+    /// of those happens, so a path that does neither would strand a full display
+    /// surface, and a path that does both would materialize a released image.
+    ///
+    /// Covers issue-38 `CGWindowListCapture.swift:376`, which made capture two-phase so
+    /// the full-resolution buffer is only built for frames that survive dedup.
+    func testEveryCaptureResolvesItsPendingCandidateExactlyOnce() async throws {
+        let duplicate = makeFrame(displayID: 4, pixelValue: 10)
+        let backend = FakeScreenCaptureBackend(frames: [duplicate, duplicate])
+        let displayMonitor = FakeDisplayMonitor(activeDisplayID: 4, hasPermission: true)
+        let displaySwitchMonitor = FakeDisplaySwitchMonitor()
+        let mouseClickMonitor = FakeMouseClickMonitor(startResult: true)
+        let collector = FrameCollector()
+        let manager = makeManager(
+            backend: backend,
+            displayMonitor: displayMonitor,
+            displaySwitchMonitor: displaySwitchMonitor,
+            mouseClickMonitor: mouseClickMonitor,
+            schedulingConfiguration: CaptureSchedulingConfiguration(
+                minimumInterCaptureInterval: 0.01,
+                mouseClickSettleDelay: 0.005,
+                windowChangeSettleDelay: 0.03,
+                startWithImmediateIntervalCapture: false
+            )
+        )
+
+        try await manager.startCapture(config: testConfig())
+        let stream = await manager.frameStream
+        let streamTask = collectFrames(from: stream, into: collector)
+        defer {
+            streamTask.cancel()
+            Task { try? await manager.stopCapture() }
+        }
+
+        await mouseClickMonitor.emitMouseUp()
+        try await sleep(milliseconds: 20)
+        await mouseClickMonitor.emitMouseUp()
+        try await sleep(milliseconds: 30)
+
+        let captures = await backend.captureCount()
+        let materialized = await backend.materializeCount
+        let discarded = await backend.discardCount
+
+        XCTAssertEqual(captures, 2, "Both mouse clicks should have produced a capture")
+        XCTAssertEqual(
+            materialized + discarded, captures,
+            "Every capture must be resolved exactly once "
+                + "(captures \(captures), materialized \(materialized), discarded \(discarded))"
+        )
+        XCTAssertEqual(materialized, 1, "The first, non-duplicate frame should be materialized")
+        XCTAssertEqual(discarded, 1, "The duplicate frame should be discarded without materializing")
+    }
+
     func testMouseClickFallsBackToCurrentCaptureDisplayWithoutPermission() async throws {
         let backend = FakeScreenCaptureBackend(
             frames: [makeFrame(displayID: 11, pixelValue: 30)]
@@ -887,6 +941,9 @@ final class MouseClickMonitorTests: XCTestCase {
 private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
     private var frames: [CapturedFrame]
     private var displayIDs: [UInt32] = []
+    private var pendingFrame: CapturedFrame?
+    private(set) var materializeCount = 0
+    private(set) var discardCount = 0
 
     init(frames: [CapturedFrame]) {
         self.frames = frames
@@ -896,10 +953,32 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
     func stopCapture() async throws {}
     func updateConfig(_ config: CaptureConfig) async throws {}
 
-    func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureCandidate? {
         displayIDs.append(displayID)
         guard !frames.isEmpty else { return nil }
-        return frames.removeFirst()
+        let frame = frames.removeFirst()
+        pendingFrame = frame
+        // The fake deduplicates against the frame itself, so scheduling tests keep
+        // exercising the real keep/drop behaviour rather than a degenerate proxy.
+        return CaptureCandidate(
+            timestamp: frame.timestamp,
+            width: frame.width,
+            height: frame.height,
+            bytesPerRow: frame.bytesPerRow,
+            metadata: frame.metadata,
+            dedupProxy: frame
+        )
+    }
+
+    func materializePendingFrame() async -> CapturedFrame? {
+        materializeCount += 1
+        defer { pendingFrame = nil }
+        return pendingFrame
+    }
+
+    func discardPendingCapture() async {
+        discardCount += 1
+        pendingFrame = nil
     }
 
     func captureCount() -> Int {

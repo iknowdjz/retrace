@@ -69,11 +69,43 @@ private struct WindowChangeSignature: Sendable {
     }
 }
 
+/// Full-resolution dimensions of a captured frame.
+struct FrameSize: Equatable, Sendable {
+    let width: Int
+    let height: Int
+}
+
+/// A captured frame that has not yet paid for its full-resolution pixel buffer.
+///
+/// Capturing a frame and building its BGRA buffer are separate steps because a large
+/// share of captured frames are discarded before that buffer is ever read — first by
+/// the window-change filter, then by deduplication. On the reference machine 37.4% of
+/// captures (8,296 of 22,168 over 66.6h) were deduplicated, each having already
+/// allocated and rendered a full 3440x1440 buffer of 19,814,400 bytes.
+struct CaptureCandidate: Sendable {
+    let timestamp: Date
+    /// Full-resolution dimensions of the captured frame, not of `dedupProxy`.
+    let width: Int
+    let height: Int
+    let bytesPerRow: Int
+    let metadata: FrameMetadata
+    /// Small point-sampled reduction, sufficient for the deduplication comparison.
+    let dedupProxy: CapturedFrame
+}
+
 protocol ScreenCaptureBackend: Actor {
     func startCapture(config: CaptureConfig, displayID: CGDirectDisplayID?) async throws
     func stopCapture() async throws
     func updateConfig(_ config: CaptureConfig) async throws
-    func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame?
+
+    /// Captures a frame without building its full-resolution buffer. The backend
+    /// retains the underlying image until `materializePendingFrame()` or
+    /// `discardPendingCapture()` is called, or until the next `captureCandidate` call.
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureCandidate?
+    /// Builds the full-resolution frame for the pending candidate.
+    func materializePendingFrame() async -> CapturedFrame?
+    /// Releases the pending candidate without building its buffer.
+    func discardPendingCapture() async
 }
 
 protocol CaptureDisplayMonitoring: Actor {
@@ -176,7 +208,14 @@ public actor CaptureManager: CaptureProtocol {
     private let now: @Sendable () -> Date
 
     private var currentConfig: CaptureConfig
-    private var lastKeptFrame: CapturedFrame?
+    /// Deduplication reference. Only the small proxy of the last kept frame is
+    /// retained, not its full-resolution buffer — the comparison never needed the
+    /// full buffer, and holding it pinned ~19.8 MB for the life of the capture session.
+    private var lastKeptProxy: CapturedFrame?
+    /// Full-resolution dimensions of the last kept frame. Tracked separately because
+    /// `lastKeptProxy` is the reduced grid, so a resolution change at the same aspect
+    /// ratio would be invisible in the proxy's own dimensions.
+    private var lastKeptFrameSize: FrameSize?
     private var lastKeptMousePosition: CGPoint?
     private var _isCapturing = false
 
@@ -316,7 +355,8 @@ public actor CaptureManager: CaptureProtocol {
         dedupedFrameContinuation = nil
         _frameStream = nil
 
-        lastKeptFrame = nil
+        lastKeptProxy = nil
+        lastKeptFrameSize = nil
         lastKeptMousePosition = nil
         lastAcceptedWindowChangeSignature = nil
         updateCaptureMemoryLedger(currentFrameBytes: 0)
@@ -397,7 +437,8 @@ public actor CaptureManager: CaptureProtocol {
         latestWindowChangeEvent = nil
         deferredDisplaySyncTask?.cancel()
         deferredDisplaySyncTask = nil
-        lastKeptFrame = nil
+        lastKeptProxy = nil
+        lastKeptFrameSize = nil
         lastKeptMousePosition = nil
         lastAcceptedWindowChangeSignature = nil
         updateCaptureMemoryLedger(currentFrameBytes: 0)
@@ -678,16 +719,19 @@ public actor CaptureManager: CaptureProtocol {
         let displayID = await displayIDForCapture(trigger: capture.trigger)
         currentCaptureDisplayID = displayID
 
-        let frame = await cgWindowListCapture.captureFrame(displayID: displayID)
+        let candidate = await cgWindowListCapture.captureCandidate(displayID: displayID)
         let captureAttemptCompletedAt = now()
-        if let frame {
+        if let candidate {
             lastActualCaptureTime = captureAttemptCompletedAt
             if let windowChangeEvent = capture.windowChangeEvent {
                 let shouldDropFrame = shouldDropWindowChangeCapture(
                     event: windowChangeEvent,
-                    capturedMetadata: frame.metadata
+                    capturedMetadata: candidate.metadata
                 )
                 if shouldDropFrame {
+                    // Dropped on metadata alone, before the full-resolution buffer
+                    // was ever built.
+                    await cgWindowListCapture.discardPendingCapture()
                     scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
                     if capture.trigger == .windowChange {
                         await syncCaptureDisplayIfNeeded()
@@ -699,7 +743,7 @@ public actor CaptureManager: CaptureProtocol {
             if let windowChangeSignature = capture.windowChangeSignature {
                 lastAcceptedWindowChangeSignature = windowChangeSignature
             }
-            await handleCapturedFrame(frame, trigger: capture.trigger)
+            await handleCapturedCandidate(candidate, trigger: capture.trigger)
             scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
         } else {
             scheduleNextIntervalCapture(from: max(captureAttemptStartedAt, captureAttemptCompletedAt))
@@ -836,21 +880,28 @@ public actor CaptureManager: CaptureProtocol {
         onAccessibilityPermissionWarning?()
     }
 
-    private func handleCapturedFrame(
-        _ frame: CapturedFrame,
+    private func handleCapturedCandidate(
+        _ candidate: CaptureCandidate,
         trigger: CaptureTrigger
     ) async {
-        updateCaptureMemoryLedger(currentFrameBytes: Int64(frame.imageData.count))
+        // The full-resolution buffer does not exist yet. Its size is exactly
+        // bytesPerRow * height, which is what imageData.count used to report here.
+        let estimatedFrameBytes = Int64(candidate.bytesPerRow) * Int64(candidate.height)
+        updateCaptureMemoryLedger(currentFrameBytes: estimatedFrameBytes)
         defer {
             updateCaptureMemoryLedger(currentFrameBytes: 0)
         }
 
         let triggerDescription = Self.triggerLogDescription(for: trigger)
-        reportCaptureObserved(trigger: trigger, timestamp: frame.timestamp)
-        totalCapturedBytes += Int64(frame.imageData.count)
+        reportCaptureObserved(trigger: trigger, timestamp: candidate.timestamp)
+        totalCapturedBytes += estimatedFrameBytes
         let totalFrames = stats.totalFramesCaptured + 1
         let currentMousePosition = currentConfig.keepFramesOnMouseMovement
-            ? Self.mousePositionWithinCapturedFrame(frame)
+            ? Self.mousePositionWithinCapturedFrame(
+                width: candidate.width,
+                height: candidate.height,
+                displayID: candidate.metadata.displayID
+            )
             : nil
 
         if currentConfig.adaptiveCaptureEnabled {
@@ -858,10 +909,15 @@ public actor CaptureManager: CaptureProtocol {
             // result. shouldKeepFrame would otherwise repeat the identical full
             // sampling scan, so the always-on capture path paid for it twice per
             // frame: once for the log line below, once for the decision.
-            let similarity = lastKeptFrame.map { deduplicator.computeSimilarity(frame, $0) }
+            //
+            // The scan runs against the small proxies rather than the full-resolution
+            // buffers: the proxy is the sampling grid the comparison would have read.
+            let similarity = lastKeptProxy.map {
+                deduplicator.computeSimilarity(candidate.dedupProxy, $0)
+            }
             let keepBySimilarity = Self.shouldKeepFrameForSimilarity(
-                frame,
-                comparedTo: lastKeptFrame,
+                frameSize: FrameSize(width: candidate.width, height: candidate.height),
+                referenceSize: lastKeptFrameSize,
                 similarity: similarity,
                 threshold: currentConfig.deduplicationThreshold
             )
@@ -873,7 +929,16 @@ public actor CaptureManager: CaptureProtocol {
             let shouldKeep = keepBySimilarity || keepByMouseMovement
 
             if shouldKeep {
-                lastKeptFrame = frame
+                // Only now is the full-resolution buffer worth building.
+                guard let frame = await cgWindowListCapture.materializePendingFrame() else {
+                    Log.warning(
+                        "[CaptureManager] Failed to materialize kept frame \(candidate.width)x\(candidate.height); dropping capture",
+                        category: .capture
+                    )
+                    return
+                }
+                lastKeptProxy = candidate.dedupProxy
+                lastKeptFrameSize = FrameSize(width: candidate.width, height: candidate.height)
                 lastKeptMousePosition = currentMousePosition
                 let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
                 dedupedFrameContinuation?.yield(enrichedFrame)
@@ -902,6 +967,11 @@ public actor CaptureManager: CaptureProtocol {
                     category: .capture
                 )
             } else {
+                // The frame is discarded without ever building its full-resolution
+                // buffer. This is the case that used to allocate and render
+                // ~19.8 MB per frame only to throw it away.
+                await cgWindowListCapture.discardPendingCapture()
+
                 stats = CaptureStatistics(
                     totalFramesCaptured: totalFrames,
                     framesDeduped: stats.framesDeduped + 1,
@@ -927,6 +997,15 @@ public actor CaptureManager: CaptureProtocol {
                 )
             }
         } else {
+            // Deduplication is off, so every captured frame is kept and always needs
+            // its full-resolution buffer.
+            guard let frame = await cgWindowListCapture.materializePendingFrame() else {
+                Log.warning(
+                    "[CaptureManager] Failed to materialize frame \(candidate.width)x\(candidate.height); dropping capture",
+                    category: .capture
+                )
+                return
+            }
             let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
             dedupedFrameContinuation?.yield(enrichedFrame)
 
@@ -937,7 +1016,8 @@ public actor CaptureManager: CaptureProtocol {
                 captureStartTime: stats.captureStartTime,
                 lastFrameTime: enrichedFrame.timestamp
             )
-            lastKeptFrame = frame
+            lastKeptProxy = candidate.dedupProxy
+            lastKeptFrameSize = FrameSize(width: candidate.width, height: candidate.height)
             lastKeptMousePosition = currentMousePosition
 
             if trigger == .mouseClick {
@@ -976,7 +1056,8 @@ public actor CaptureManager: CaptureProtocol {
 
     private func updateCaptureMemoryLedger(currentFrameBytes: Int64) {
         let normalizedCurrentFrameBytes = max(0, currentFrameBytes)
-        let lastKeptFrameBytes = Int64(lastKeptFrame?.imageData.count ?? 0)
+        // Only the reduced proxy is retained now, not the full-resolution frame.
+        let lastKeptFrameBytes = Int64(lastKeptProxy?.imageData.count ?? 0)
 
         MemoryLedger.set(
             tag: Self.memoryLedgerCurrentFrameTag,
@@ -989,7 +1070,7 @@ public actor CaptureManager: CaptureProtocol {
         MemoryLedger.set(
             tag: Self.memoryLedgerLastKeptFrameTag,
             bytes: lastKeptFrameBytes,
-            count: lastKeptFrame == nil ? 0 : 1,
+            count: lastKeptProxy == nil ? 0 : 1,
             unit: "frames",
             function: "capture.deduplication",
             kind: "reference-frame",
@@ -1018,11 +1099,31 @@ public actor CaptureManager: CaptureProtocol {
         similarity: Double?,
         threshold: Double
     ) -> Bool {
+        shouldKeepFrameForSimilarity(
+            frameSize: FrameSize(width: frame.width, height: frame.height),
+            referenceSize: reference.map { FrameSize(width: $0.width, height: $0.height) },
+            similarity: similarity,
+            threshold: threshold
+        )
+    }
+
+    /// Dimension-only form, used by the capture path.
+    ///
+    /// The similarity score is computed from the reduced deduplication proxies, but the
+    /// dimension check must run against the full-resolution sizes: a resolution change
+    /// that preserves the aspect ratio produces an identically-sized proxy and would
+    /// otherwise go unnoticed.
+    static func shouldKeepFrameForSimilarity(
+        frameSize: FrameSize,
+        referenceSize: FrameSize?,
+        similarity: Double?,
+        threshold: Double
+    ) -> Bool {
         // No reference frame: always keep, matching shouldKeepFrame.
-        guard let reference, let similarity else { return true }
+        guard let referenceSize, let similarity else { return true }
 
         // A dimension change is always kept, without consulting the score.
-        if frame.width != reference.width || frame.height != reference.height {
+        if frameSize != referenceSize {
             return true
         }
 
@@ -1080,11 +1181,24 @@ public actor CaptureManager: CaptureProtocol {
     }
 
     private static func mousePositionWithinCapturedFrame(_ frame: CapturedFrame) -> CGPoint? {
+        mousePositionWithinCapturedFrame(
+            width: frame.width,
+            height: frame.height,
+            displayID: frame.metadata.displayID
+        )
+    }
+
+    private static func mousePositionWithinCapturedFrame(
+        width frameWidth: Int,
+        height frameHeight: Int,
+        displayID frameDisplayID: UInt32
+    ) -> CGPoint? {
+        let frame = (width: frameWidth, height: frameHeight)
         guard frame.width > 0, frame.height > 0 else { return nil }
         guard let event = CGEvent(source: nil) else { return nil }
 
         let location = event.location
-        let displayBounds = CGDisplayBounds(CGDirectDisplayID(frame.metadata.displayID))
+        let displayBounds = CGDisplayBounds(CGDirectDisplayID(frameDisplayID))
         guard displayBounds.width > 0,
               displayBounds.height > 0,
               displayBounds.contains(location) else {

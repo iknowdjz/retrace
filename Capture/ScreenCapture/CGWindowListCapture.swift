@@ -234,6 +234,23 @@ public actor CGWindowListCapture {
         let visibleExcludedWindowIDs: Set<CGWindowID>
     }
 
+    /// A captured image whose full-resolution BGRA buffer has not been built yet.
+    ///
+    /// Holds the CGImage (and therefore its backing surface) alive between
+    /// `captureCandidate(displayID:)` and the decision to keep or drop the frame.
+    /// Actor-isolated: the image never crosses the actor boundary, only the small
+    /// deduplication proxy does.
+    private struct PendingCapture {
+        let image: CGImage
+        let timestamp: Date
+        let width: Int
+        let height: Int
+        let metadata: FrameMetadata
+    }
+
+    /// The capture awaiting a keep/drop decision. At most one is ever held.
+    private var pendingCapture: PendingCapture?
+
     private struct PrivateWindowDecisionState: Sendable {
         let ownerPID: pid_t
         let isPrivate: Bool
@@ -279,6 +296,11 @@ public actor CGWindowListCapture {
         isActive = false
         lastCaptureBlockReason = nil
         screenLockStateMonitor.stop()
+        // Release any candidate awaiting a keep/drop decision. Without this, stopping
+        // capture while one is pending would retain its backing surface for as long as
+        // capture stays stopped, since nothing else clears the slot until the next
+        // captureCandidate call.
+        releasePendingCapture()
         lastDisplaySurfaceBytes = 0
         updatePersistentCaptureNativeLedger()
     }
@@ -301,13 +323,76 @@ public actor CGWindowListCapture {
 
     // MARK: - Private Helpers
 
-    func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
+    /// Captures a frame without paying for its full-resolution pixel buffer.
+    ///
+    /// The caller decides whether to keep the frame using the returned proxy, then
+    /// calls `materializePendingFrame()` or `discardPendingCapture()`.
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureCandidate? {
         currentDisplayID = displayID
-        return await captureFrameInternal(displayID: displayID)
+        return await captureCandidateInternal(displayID: displayID)
+    }
+
+    /// Builds the full-resolution BGRA frame for the pending candidate.
+    ///
+    /// Returns nil if there is no pending candidate or the conversion fails. Either
+    /// way the pending capture is released, so a failure cannot strand the image.
+    func materializePendingFrame() -> CapturedFrame? {
+        guard let pending = pendingCapture else { return nil }
+        defer { releasePendingCapture() }
+
+        guard let frameData = convertCGImageToBGRAData(pending.image) else {
+            Log.warning(
+                "[CGWindowListCapture] Failed to convert CGImage to BGRA data for \(pending.width)x\(pending.height)",
+                category: .capture
+            )
+            return nil
+        }
+
+        return CapturedFrame(
+            timestamp: pending.timestamp,
+            imageData: frameData,
+            width: pending.width,
+            height: pending.height,
+            bytesPerRow: pending.width * 4,
+            metadata: pending.metadata
+        )
+    }
+
+    /// Releases a candidate the caller decided not to keep, without building its buffer.
+    func discardPendingCapture() {
+        releasePendingCapture()
+    }
+
+    private func releasePendingCapture() {
+        guard pendingCapture != nil else { return }
+        pendingCapture = nil
+        clearDisplaySurfaceLedger()
+    }
+
+    /// Reports the captured surface as released.
+    ///
+    /// Separate from `releasePendingCapture()` because the surface tag is set as soon
+    /// as the image is captured, which is before `pendingCapture` is assigned — a
+    /// failure in between must still clear the tag or the ledger reports a surface
+    /// that no longer exists.
+    private func clearDisplaySurfaceLedger() {
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDisplaySurfaceTag,
+            bytes: 0,
+            count: 0,
+            unit: "surfaces",
+            function: "capture.screen_capture",
+            kind: "cgimage-surface",
+            note: "estimated-native"
+        )
     }
 
     /// Capture a single frame with real-time filtering of excluded apps and private windows
-    private func captureFrameInternal(displayID: CGWindowID) async -> CapturedFrame? {
+    private func captureCandidateInternal(displayID: CGWindowID) async -> CaptureCandidate? {
+        // Release anything a previous capture left un-materialised. This bounds the
+        // number of retained images to one even if a caller abandons a candidate.
+        releasePendingCapture()
+
         guard isActive, let config = currentConfig else { return nil }
         let residualEpoch = await MemoryLedger.beginResidualEpoch(
             ownerFunction: "capture.screen_capture",
@@ -360,28 +445,24 @@ public actor CGWindowListCapture {
             reason: "capture.screen_capture.memory",
             residualEpoch: residualEpoch
         )
-        defer {
-            MemoryLedger.set(
-                tag: Self.memoryLedgerDisplaySurfaceTag,
-                bytes: 0,
-                count: 0,
-                unit: "surfaces",
-                function: "capture.screen_capture",
-                kind: "cgimage-surface",
-                note: "estimated-native"
-            )
-        }
-
-        // Convert CGImage to BGRA data format (matching ScreenCaptureKit output)
-        guard let frameData = convertCGImageToBGRAData(cgImage) else {
-            Log.warning("[CGWindowListCapture] Failed to convert CGImage to BGRA data for displayID=\(displayID)", category: .capture)
-            return nil
-        }
+        // NOTE: the display-surface ledger tag is deliberately NOT reset on the way out
+        // of this function. The CGImage now outlives the call as `pendingCapture`, so
+        // the tag is cleared in releasePendingCapture() instead — resetting it here
+        // would report the surface as freed while it is still retained.
 
         // Get display info and captured image dimensions
         let width = cgImage.width
         let height = cgImage.height
         let bytesPerRow = width * 4
+
+        // Build the small deduplication proxy rather than the full-resolution buffer.
+        // The full buffer is only built for frames that survive the keep decision.
+        guard let dedupProxy = Self.makeDeduplicationProxy(cgImage) else {
+            Log.warning("[CGWindowListCapture] Failed to build dedup proxy for displayID=\(displayID)", category: .capture)
+            // pendingCapture is not assigned yet, so only the surface tag needs clearing.
+            clearDisplaySurfaceLedger()
+            return nil
+        }
 
         Log.verbose("[CGWindowListCapture] Frame captured: \(width)x\(height), excluded \(excludedIDs.count) windows", category: .capture)
 
@@ -398,23 +479,94 @@ public actor CGWindowListCapture {
         let resolvedAppName = redactionSummary?.appName ?? visibleWindowContext?.appName
         let resolvedWindowName = redactionSummary == nil ? visibleWindowContext?.windowName : nil
 
-        // Create captured frame
-        let frame = CapturedFrame(
-            timestamp: Date(),
-            imageData: frameData,
+        let metadata = FrameMetadata(
+            appBundleID: resolvedAppBundleID,
+            appName: resolvedAppName,
+            windowName: resolvedWindowName,
+            redactionReason: redactionSummary?.reason,
+            displayID: UInt32(displayID)
+        )
+        let timestamp = Date()
+
+        // Retain the image so the caller can materialize it if the frame is kept.
+        pendingCapture = PendingCapture(
+            image: cgImage,
+            timestamp: timestamp,
+            width: width,
+            height: height,
+            metadata: metadata
+        )
+
+        return CaptureCandidate(
+            timestamp: timestamp,
             width: width,
             height: height,
             bytesPerRow: bytesPerRow,
-            metadata: FrameMetadata(
-                appBundleID: resolvedAppBundleID,
-                appName: resolvedAppName,
-                windowName: resolvedWindowName,
-                redactionReason: redactionSummary?.reason,
-                displayID: UInt32(displayID)
-            )
+            metadata: metadata,
+            dedupProxy: dedupProxy
         )
+    }
 
-        return frame
+    /// Builds a small point-sampled reduction of a captured image, used only to make
+    /// the deduplication decision.
+    ///
+    /// `FrameDeduplicator.computeSimilarity` samples a uniform grid of ~10k pixels out
+    /// of the full-resolution buffer, so reducing to exactly that grid carries the same
+    /// information at roughly 1/500th the size.
+    ///
+    /// Nearest-neighbour (`interpolationQuality = .none`) is load-bearing, not an
+    /// optimization: an averaging downsample would blur small localized changes — a
+    /// caret, a few edited characters — into the surrounding pixels, reading as a
+    /// higher similarity and silently deduplicating real screen activity. Point
+    /// sampling preserves the comparison semantics the 0.9985 threshold was tuned for.
+    static func makeDeduplicationProxy(_ cgImage: CGImage) -> CapturedFrame? {
+        let grid = deduplicationProxyGrid(width: cgImage.width, height: cgImage.height)
+        guard grid.cols > 0, grid.rows > 0 else { return nil }
+
+        let bytesPerRow = grid.cols * 4
+        var pixelData = Data(count: bytesPerRow * grid.rows)
+        let success = pixelData.withUnsafeMutableBytes { rawBufferPointer -> Bool in
+            guard let baseAddress = rawBufferPointer.baseAddress else { return false }
+            guard let context = CGContext(
+                data: baseAddress,
+                width: grid.cols,
+                height: grid.rows,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            ) else {
+                return false
+            }
+            context.interpolationQuality = .none
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: grid.cols, height: grid.rows))
+            return true
+        }
+
+        guard success else { return nil }
+
+        return CapturedFrame(
+            timestamp: Date(),
+            imageData: pixelData,
+            width: grid.cols,
+            height: grid.rows,
+            bytesPerRow: bytesPerRow,
+            metadata: .empty
+        )
+    }
+
+    /// Mirrors the sampling grid `FrameDeduplicator.computeSimilarity` derives, so the
+    /// proxy contains one pixel per pixel that comparison would have sampled.
+    ///
+    /// Clamped to the source dimensions so a small display is never "reduced" to a
+    /// larger buffer than the image it came from.
+    static func deduplicationProxyGrid(width: Int, height: Int) -> (cols: Int, rows: Int) {
+        guard width > 0, height > 0 else { return (0, 0) }
+        let sampleSize = 10_000.0
+        let aspectRatio = Double(width) / Double(height)
+        let rows = max(1, Int((sampleSize / aspectRatio).squareRoot()))
+        let cols = max(1, Int(Double(rows) * aspectRatio))
+        return (cols: min(cols, width), rows: min(rows, height))
     }
 
     /// Compute which window IDs should be excluded based on current config
