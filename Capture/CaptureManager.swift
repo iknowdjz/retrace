@@ -886,8 +886,12 @@ public actor CaptureManager: CaptureProtocol {
     ) async {
         // The full-resolution buffer does not exist yet. Its size is exactly
         // bytesPerRow * height, which is what imageData.count used to report here.
+        //
+        // Deliberately NOT reported to the memory ledger up front: for a frame that is
+        // about to be deduplicated the buffer is never built, so claiming it here would
+        // report ~19.8 MB of resident frame that this change exists to avoid. The
+        // ledger is updated once the buffer actually exists, after materialization.
         let estimatedFrameBytes = Int64(candidate.bytesPerRow) * Int64(candidate.height)
-        updateCaptureMemoryLedger(currentFrameBytes: estimatedFrameBytes)
         defer {
             updateCaptureMemoryLedger(currentFrameBytes: 0)
         }
@@ -935,8 +939,13 @@ public actor CaptureManager: CaptureProtocol {
                         "[CaptureManager] Failed to materialize kept frame \(candidate.width)x\(candidate.height); dropping capture",
                         category: .capture
                     )
+                    // The capture did not complete, so roll back the byte total that was
+                    // added for it — otherwise averageFrameSizeBytes counts bytes for a
+                    // frame that is never reflected in totalFramesCaptured.
+                    totalCapturedBytes -= estimatedFrameBytes
                     return
                 }
+                updateCaptureMemoryLedger(currentFrameBytes: Int64(frame.imageData.count))
                 lastKeptProxy = candidate.dedupProxy
                 lastKeptFrameSize = FrameSize(width: candidate.width, height: candidate.height)
                 lastKeptMousePosition = currentMousePosition
@@ -1004,8 +1013,10 @@ public actor CaptureManager: CaptureProtocol {
                     "[CaptureManager] Failed to materialize frame \(candidate.width)x\(candidate.height); dropping capture",
                     category: .capture
                 )
+                totalCapturedBytes -= estimatedFrameBytes
                 return
             }
+            updateCaptureMemoryLedger(currentFrameBytes: Int64(frame.imageData.count))
             let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
             dedupedFrameContinuation?.yield(enrichedFrame)
 
