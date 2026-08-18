@@ -22,6 +22,17 @@ public enum ReversibleOCRScrambler {
         return masterKeySecret
     }
 
+    /// Permutes BGRA blocks into a key-seeded order.
+    ///
+    /// **This is not a confidentiality primitive and must not be used for redaction.** Every
+    /// original pixel survives the call -- only positions change -- so the region is recoverable
+    /// without the master key via jigsaw/edge-matching reassembly, and small regions have
+    /// permutation spaces small enough to brute-force by eye. Redaction uses
+    /// `BGRAImageUtilities.destructivelyRedactPatch`, which is one-way. See docs/backlog/issue-34.md.
+    ///
+    /// Retained only so the legacy descramble path can be exercised against data written by
+    /// older builds.
+    @available(*, deprecated, message: "Insecure: reversible without the key. Redaction must use BGRAImageUtilities.destructivelyRedactPatch. Retained only for legacy descramble tests.")
     public static func scramblePatchBGRA(
         _ patch: inout Data,
         width: Int,

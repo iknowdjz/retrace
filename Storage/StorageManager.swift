@@ -234,7 +234,7 @@ fileprivate actor SegmentRewriteExecutor {
                         guard pixelRect.width > 1, pixelRect.height > 1 else { continue }
                         if loggedTargets < 20 {
                             Log.debug(
-                                "[PhraseRedaction][Storage] Scramble mapping node=\(target.nodeID) frame=\(target.frameID) normalized=(\(String(format: "%.4f", target.normalizedRect.origin.x)),\(String(format: "%.4f", target.normalizedRect.origin.y)),\(String(format: "%.4f", target.normalizedRect.width)),\(String(format: "%.4f", target.normalizedRect.height))) pixelRect=(x=\(Int(pixelRect.origin.x)),y=\(Int(pixelRect.origin.y)),w=\(Int(pixelRect.width)),h=\(Int(pixelRect.height))) image=\(width)x\(height)",
+                                "[PhraseRedaction][Storage] Redaction mapping node=\(target.nodeID) frame=\(target.frameID) normalized=(\(String(format: "%.4f", target.normalizedRect.origin.x)),\(String(format: "%.4f", target.normalizedRect.origin.y)),\(String(format: "%.4f", target.normalizedRect.width)),\(String(format: "%.4f", target.normalizedRect.height))) pixelRect=(x=\(Int(pixelRect.origin.x)),y=\(Int(pixelRect.origin.y)),w=\(Int(pixelRect.width)),h=\(Int(pixelRect.height))) image=\(width)x\(height)",
                                 category: .storage
                             )
                             loggedTargets += 1
@@ -246,15 +246,13 @@ fileprivate actor SegmentRewriteExecutor {
                         ) else {
                             continue
                         }
-                        ReversibleOCRScrambler.scramblePatchBGRA(
-                            &patch.data,
-                            width: patch.width,
-                            height: patch.height,
-                            bytesPerRow: patch.bytesPerRow,
-                            frameID: target.frameID,
-                            nodeID: target.nodeID,
-                            secret: request.secret ?? ""
-                        )
+                        // Destroy the pixels outright. This used to permute 2-16px blocks
+                        // into a key-seeded order, which left every original pixel intact in
+                        // the stored frame -- so the region was recoverable *without* the
+                        // master key by jigsaw/edge-matching reassembly, and a small region's
+                        // permutation space is brute-forceable by eye. Destroying the pixels
+                        // needs no secret and cannot be undone by anyone. See issue-34.
+                        BGRAImageUtilities.destructivelyRedactPatch(&patch)
                         BGRAImageUtilities.writePatch(
                             patch,
                             into: &bgra,
