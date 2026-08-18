@@ -38,6 +38,9 @@ fileprivate struct SegmentRewriteRequest: Sendable {
     let workingURL: URL
     let backupURL: URL
     let plan: SegmentRewritePlan
+    /// Retained for the OCR *text* path and any future encrypted-sidecar work. Pixel redaction
+    /// no longer consumes it: regions are destroyed outright, so redaction cannot be blocked by
+    /// a missing master key. See issue-34.
     let secret: String?
 }
 
@@ -175,13 +178,6 @@ fileprivate actor SegmentRewriteExecutor {
             throw StorageError.fileWriteFailed(
                 path: request.segmentURL.path,
                 underlying: "Whole-video deletes must not use the rewrite executor"
-            )
-        }
-
-        if request.plan.hasRedactionTargets, request.secret == nil {
-            throw StorageError.fileWriteFailed(
-                path: request.segmentURL.path,
-                underlying: "Missing rewrite secret for redaction targets"
             )
         }
 

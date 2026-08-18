@@ -694,6 +694,83 @@ final class StorageManagerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    /// Redaction must not depend on the master key.
+    ///
+    /// Pixel regions are destroyed rather than permuted, so no secret is required. This matters
+    /// on installs that have no master key at all -- refusing to redact there would leave the
+    /// sensitive pixels sitting in the stored video, which is the fail-*open* outcome. See
+    /// issue-34.
+    func testRedactionDestroysRegionEvenWithNoSecret() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        let targetRect = CGRect(x: 16, y: 16, width: 32, height: 32)
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(width: 64, height: 64, targetRect: targetRect)
+        )
+        _ = try await writer.finalize()
+
+        let beforeJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+
+        // secret: nil -- this used to throw "Missing rewrite secret for redaction targets".
+        try await storage.applySegmentRewrite(
+            segmentID: segmentID,
+            plan: SegmentRewritePlan(
+                redactions: [
+                    SegmentFrameRedaction(
+                        frameID: 42,
+                        frameIndex: 0,
+                        targets: [
+                            SegmentRedactionTarget(
+                                frameID: 42,
+                                nodeID: 7,
+                                normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                            )
+                        ]
+                    )
+                ]
+            ),
+            secret: nil
+        )
+
+        let afterJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        let beforeImage = try decodeJPEG(beforeJPEG)
+        let afterImage = try decodeJPEG(afterJPEG)
+        let beforeBGRA = try StorageManager.makeBGRAData(from: beforeImage)
+        let afterBGRA = try StorageManager.makeBGRAData(from: afterImage)
+
+        let beforeTarget = extractPatch(from: beforeBGRA, imageWidth: beforeImage.width, rect: targetRect)
+        let afterTarget = extractPatch(from: afterBGRA, imageWidth: afterImage.width, rect: targetRect)
+
+        // The region changed materially...
+        XCTAssertGreaterThan(averageAbsoluteDifference(beforeTarget, afterTarget), 6.0)
+
+        // ...and specifically towards black. Measure colour channels only: the buffer is BGRA
+        // and alpha is deliberately opaque, so including it would put the floor at 255/4.
+        func colourMean(_ bytes: Data) -> Double {
+            var total = 0.0
+            var count = 0
+            for (index, byte) in bytes.enumerated() where index % 4 != 3 {
+                total += Double(byte)
+                count += 1
+            }
+            return count == 0 ? 0 : total / Double(count)
+        }
+
+        let afterMean = colourMean(afterTarget)
+        let beforeMean = colourMean(beforeTarget)
+        XCTAssertLessThan(afterMean, beforeMean, "redacted region should be darker than the original")
+        XCTAssertLessThan(afterMean, 8.0, "redacted region should be black, got colour mean \(afterMean)")
+
+        // Non-vacuous: the original region actually had content worth destroying.
+        XCTAssertGreaterThan(beforeMean, 40.0)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
     func testApplySegmentRewriteBlacksTargetedFramesAndLeavesUntouchedFramesMateriallyStable() async throws {
         let root = makeTempRoot()
         let storage = StorageManager(storageRoot: root)
