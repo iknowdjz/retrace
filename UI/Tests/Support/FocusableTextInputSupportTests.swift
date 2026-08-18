@@ -238,7 +238,14 @@ final class FocusableTextInputSupportTests: XCTestCase {
         coordinator.controlTextDidEndEditing(
             Notification(name: NSControl.textDidEndEditingNotification, object: textField)
         )
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        // Editing is restored through a DispatchQueue.main.async hop, so wait for that
+        // to land rather than for a fixed interval. A flat 0.05 s wait failed here
+        // whenever the machine was loaded: the block simply had not run yet, and the
+        // test reported a focus bug that did not exist.
+        let deadline = Date().addingTimeInterval(5)
+        while textField.currentEditor() == nil, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
 
         XCTAssertTrue(isFocused)
         XCTAssertTrue(focusTransitions.isEmpty)
