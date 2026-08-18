@@ -60,6 +60,22 @@ public class PauseReminderManager: ObservableObject {
     /// Whether the user has dismissed the reminder for this pause session
     @Published public var isDismissedForSession = false
 
+    /// The inputs to the last logged reminder tick, so unchanged ticks stay out of the log.
+    ///
+    /// The tick fires on a timer whether or not anything moved. Over one 2.1 h window the live
+    /// log carried 3,823 of these lines encoding 4 actual state changes -- 19.6% of every line
+    /// the app wrote, repeating itself. Logging transitions keeps the diagnostic value and drops
+    /// the repetition.
+    private var lastLoggedTickState: TickState?
+
+    private struct TickState: Equatable {
+        let isCapturing: Bool
+        let wasCapturing: Bool
+        let onboardingComplete: Bool
+        let pausedState: Bool
+        let reminderVisible: Bool
+    }
+
     // MARK: - Configuration
 
     /// Duration after which to show the reminder (5 minutes)
@@ -161,10 +177,20 @@ public class PauseReminderManager: ObservableObject {
         let hasCompletedOnboarding = await coordinator.onboardingManager.hasCompletedOnboarding
         let isPausedState = MenuBarManager.shared?.isPausedState == true
 
-        Log.debug(
-            "[PauseReminderManager] Reminder interval tick isCapturing=\(isCapturing) wasCapturing=\(wasCapturing) onboardingComplete=\(hasCompletedOnboarding) pausedState=\(isPausedState) reminderVisible=\(shouldShowReminder)",
-            category: .ui
+        let tickState = TickState(
+            isCapturing: isCapturing,
+            wasCapturing: wasCapturing,
+            onboardingComplete: hasCompletedOnboarding,
+            pausedState: isPausedState,
+            reminderVisible: shouldShowReminder
         )
+        if tickState != lastLoggedTickState {
+            lastLoggedTickState = tickState
+            Log.debug(
+                "[PauseReminderManager] Reminder state changed isCapturing=\(isCapturing) wasCapturing=\(wasCapturing) onboardingComplete=\(hasCompletedOnboarding) pausedState=\(isPausedState) reminderVisible=\(shouldShowReminder)",
+                category: .ui
+            )
+        }
 
         if !hasCompletedOnboarding {
             if pauseStartTime != nil || reminderTimer != nil || remindLaterTimer != nil || shouldShowReminder {
