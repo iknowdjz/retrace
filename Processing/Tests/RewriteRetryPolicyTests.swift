@@ -188,8 +188,13 @@ private actor FailingRewriteStorage: StorageProtocol, RewriteAttemptCountingStor
     }
 }
 
-private struct RewriteTestTimeout: Error {
+private struct RewriteTestTimeout: Error, CustomStringConvertible {
     let stage: String
+    let seconds: Double
+
+    var description: String {
+        "Timed out after \(seconds)s waiting for: \(stage)"
+    }
 }
 
 /// Delivers whichever of two racing tasks finishes first and ignores the loser.
@@ -518,7 +523,7 @@ final class RewriteRetryPolicyTests: XCTestCase {
         }
         let timeoutTask = Task {
             try? await Task.sleep(for: .seconds(seconds), clock: .continuous)
-            await outcome.resolve(.failure(RewriteTestTimeout(stage: stage)))
+            await outcome.resolve(.failure(RewriteTestTimeout(stage: stage, seconds: seconds)))
         }
         defer {
             operationTask.cancel()
@@ -529,13 +534,8 @@ final class RewriteRetryPolicyTests: XCTestCase {
         case .success(let value):
             return value
         case .failure(let error):
-            if let timeout = error as? RewriteTestTimeout {
-                XCTFail(
-                    "Timed out after \(seconds)s waiting for: \(timeout.stage)",
-                    file: file,
-                    line: line
-                )
-            }
+            // Throwing from an async test already records a failure carrying this
+            // error's description, so an XCTFail here would report the same timeout twice.
             throw error
         }
     }
