@@ -49,7 +49,12 @@ Companion to the security tracking issue (#35). A **Fable 5** fleet swept the tr
   _In configureReadOnlyConnection add: `PRAGMA cache_size=-32000;` (32MB per read connection, tune to taste) and `PRAGMA mmap_size=268435456;` (256MB mmap — read-mostly workload benefits and it is shared across…_ (risk:low, 🟢 safe to land by inspection)
 - `FTSQueries.swift:323` ✅ — **Per-row statement prepare inside docid orphan-check loop**  
   _Hoist the stillReferencedSQL prepare above the loop (like contentStatement at lines 298-309) and use sqlite3_reset/sqlite3_clear_bindings per iteration._ (risk:low, 🟢 safe to land by inspection)
-- `FrameProcessingQueue.swift:2276` ✅ — **Redaction phrases re-loaded and re-normalized from UserDefaults on every frame**  
+- `FrameProcessingQueue.swift:2276` ❌ **MEASURED AND REJECTED (2026-08-17)** — **Redaction phrases re-loaded and re-normalized from UserDefaults on every frame**  
+  _The per-frame prologue is `UserDefaults(suiteName:)` + one `string(forKey:)` that misses when no
+  phrases are configured (the default, and this install's state). Measured over 20,000 iterations:
+  **0.00063 ms/frame** — 0.0001% of the 655.8 ms mean frame OCR. Caching it would be measuring
+  nothing. Revisit only if a user configures a large phrase list, where the JSON decode and
+  normalisation actually run._  
   _Cache `[NormalizedPhraseRedactionPhrase]` (plus the enabled flag) in the FrameProcessingQueue actor, keyed by the raw defaults string; on each frame, read only the raw string (or subscribe to…_ (risk:low, 🟢 safe to land by inspection)
 - `FrameProcessingQueue.swift:2130` ✅ — **Fuzzy token overlap allocates filter+sort inside triple-nested matching loop**  
   _Precompute the length-descending sorted token array for `rhs` once per call (it doesn't change), and track consumed tokens with the existing set; iterate the presorted array skipping consumed entries instead of…_ (risk:low, 🟢 safe to land by inspection)
@@ -92,12 +97,35 @@ Companion to the security tracking issue (#35). A **Fable 5** fleet swept the tr
   _Seek to max(0, fileSize - N) with a FileHandle and read only the tail chunk (e.g. 256KB — far more than 200 lines), decode, drop the first partial line, then split. Keeps the same signature and lock discipline._ (risk:low, 🟢 safe to land by inspection)
 - `SimpleTimelineViewModel.swift:3371` 🔶 plausible — **Synchronous FileManager.fileExists on the main actor in the per-frame disk-buffer read path**  
   _Delete the fileExists pre-check and let the detached Data(contentsOf:) attempt fail; map ENOENT-style errors to the existing 'read missing file' removal path and other errors to 'read failure'. For line 10534, check…_ (risk:low, 🟡 wants a build/profile or migration)
-- `FrameProcessingQueue.swift:1607` 🔶 plausible — **Full BGRA re-render of every JPEG frame before OCR (double image materialization)**  
+- `FrameProcessingQueue.swift:1607` ❌ **PREMISE DISPROVED (2026-08-17)** — **Full BGRA re-render of every JPEG frame before OCR (double image materialization)**  
+  _There is no double materialization. `convertJPEGToCapturedFrame` passes
+  `kCGImageSourceShouldCacheImmediately: false`, so `CGImageSourceCreateImageAtIndex` does no
+  decoding — the decode is deferred into the `context.draw`. Measured at 3440x1440, 10 runs:
+  lazy = 0.11 ms decode + 19.22 ms draw; forcing the decode up front
+  (`ShouldCacheImmediately: true`) = 10.12 ms decode + 7.41 ms draw. Same total work, just
+  attributed differently. The image is materialized exactly once, and both Vision and
+  `TileChangeDetector` need those pixels, so there is nothing to remove — only ~19 ms of
+  unavoidable JPEG-to-pixels cost (~3% of frame OCR time)._  
   _Carry the decoded CGImage alongside (or instead of) the raw Data in CapturedFrame for the queue path, pass it straight to VNImageRequestHandler(cgImage:), and derive the change-detection buffer from a downscaled draw…_ (risk:medium, 🟡 wants a build/profile or migration)
 - `FrameProcessingQueue.swift:2543` 🔶 plausible — **Phrase redaction sliding window materializes candidate sets/strings for every token position**  
   _Add a cheap pre-filter: skip a window start unless the token at `start` matches (or prefix-matches) the phrase's first token, and compute the node-order span incrementally instead of building a Set per window (node…_ (risk:medium, 🟡 wants a build/profile or migration)
 - `HEVCEncoder.swift:540` 🔶 plausible — **Three filesystem stat calls per encoded frame on the encode hot path**  
   _Keep the size stat at line 546 (it drives durable-frontier tracking) but drop the two fileExists calls, or gate the deletion check to every ~30 frames / once per fragment. A deleted file is still caught by the size stat…_ (risk:medium, 🟡 wants a build/profile or migration)
+
+### ⭐ Found by measurement, not in the original sweep (2026-08-17)
+- `VisionOCR.swift:591` ✅ **LANDED** — **Region OCR paid for Vision's language-correction pass on every frame**  
+  _The full-frame path already hardcoded `usesLanguageCorrection: false`; the region path — the one
+  production actually uses (1,121 of 1,255 frames, mean 655.8 ms) — passed
+  `ocrAccuracyLevel == .accurate`, i.e. always true. Measured **27.9% faster** with it off
+  (1778.4 → 1283.0 ms on a 24-region frame) at **identical search-token recall** (35/36 code, 36/36
+  prose) and slightly *more* text recognised. ~3.0% of one core, freed continuously. Now
+  `ProcessingConfig.ocrLanguageCorrectionEnabled`, default off._
+
+### Steady-state cost, measured (2026-08-17)
+From the live app's own log, 1,255 real frames over ~2.13 h: OCR is **10.9% of one core**
+(mean 667 ms/frame, median 440 ms, p90 1.60 s). Over three days that is ~471 CPU-minutes —
+most of the 676 CPU-minutes that prompted this work. **OCR is the cost centre**; the ledger,
+UserDefaults and image-conversion candidates above are all under 5% of it combined.
 
 ### Highest-impact picks (suggested order)
 1. `WALManager.swift:233/244` — the always-on WAL write path rewrites `metadata.json` (atomic temp+rename) **and** rebuilds the full frame-offset index on **every captured frame** (O(n²) syscall traffic). Throttle metadata saves + extend the offset index incrementally. 🟡
