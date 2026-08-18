@@ -27,7 +27,14 @@ Companion to the security tracking issue (#35). A **Fable 5** fleet swept the tr
   _After the index insert in storeFrameDataInDiskFrameBuffer, if diskFrameBufferBytes exceeds a cap (e.g. 512 MB, matching SearchViewModel.thumbnailDiskCacheMaxBytes), evict timelineManaged entries with the lowest…_ (risk:low, 🟢 safe to land by inspection)
 - `SpotlightSearchOverlay.swift:1320` ✅ — **Thumbnail cache key includes the search query, so the same frame is re-extracted and re-stored on disk for every distinct query**  
   _Key by segmentID + timestamp + the highlight rect when result.highlightNode is present (e.g. "seg_ts_x-y-w-h"), and just segmentID + timestamp otherwise. Non-highlighted thumbnails (the common case) then dedupe across…_ (risk:medium, 🟢 safe to land by inspection)
-- `Logging.swift:389` ✅ — **Log cap allows up to 100MB on disk (50MB retrace.log + 50MB retrace.old.log)**  
+- `Logging.swift:389` ❌ **REJECTED ON TRADE-OFF (2026-08-17)** — **Log cap allows up to 100MB on disk (50MB retrace.log + 50MB retrace.old.log)**  
+  _100 MB is not a problem on a machine whose Retrace database is 33 GB; the 6.30 GB that actually
+  mattered was `cpu_process_usage.jsonl`, already reclaimed in 489b883. Measured growth is
+  **1.57 MB/h (~37.6 MB/day)** before the pause-reminder fix, ~30 MB/day after — so 50 MB is
+  roughly 1.6 days of history. Dropping the cap to 10 MB would leave about 8 hours, which is less
+  than one overnight, and this log is the primary diagnostic surface (every measurement in this
+  session's OCR work came out of it). Trading days of diagnosability for 80 MB of disk is the
+  wrong direction._  
   _Reduce maxFileSize to 10MB (20MB total with the .old file). One-character-class change: `private let maxFileSize: Int64 = 10 * 1024 * 1024`. Diagnostics (getRecentLogs maxCount 200) are unaffected._ (risk:low, 🟢 safe to land by inspection)
 - `Schema.swift:105` ✅ — **auto_vacuum pragma is dead code; space reclamation relies on full VACUUM rewrites**  
   _Pick one: (a) actually enable incremental auto-vacuum — run setAutoVacuum before table creation for new DBs (existing DBs need one full VACUUM to convert), then replace routine full VACUUMs with cheap periodic `PRAGMA…_ (risk:medium, 🟡 wants a build/profile or migration)
@@ -66,7 +73,16 @@ Companion to the security tracking issue (#35). A **Fable 5** fleet swept the tr
   _In removeDiskFrameBufferEntries, collect the file URLs to delete after updating the index synchronously (index correctness preserved), then delete them in a single Task.detached(priority: .utility). Same for…_ (risk:medium, 🟢 safe to land by inspection)
 - `SimpleTimelineViewModel.swift:2482` ✅ — **In-memory JPEG frame cache is count-limited only — up to ~192 full-resolution JPEGs held with no byte budget**  
   _Set cache.totalCostLimit (e.g. 128 * 1024 * 1024) in makeInMemoryJPEGFrameCache and pass cost: data.count in storeInMemoryJPEGFrameData. countLimit can stay as a secondary bound._ (risk:low, 🟢 safe to land by inspection)
-- `Logging.swift:56` ✅ — **Every log level (including DEBUG) does synchronous per-line file I/O in release builds**  
+- `Logging.swift:56` ❌ **MEASURED AND REJECTED (2026-08-17)** — **Every log level (including DEBUG) does synchronous per-line file I/O in release builds**  
+  _Measured over 20,000 iterations, a full `Log.debug` costs **3.1 us** (2.0 us file I/O, 1.0 us
+  formatting, OSLog effectively free). At the app's real rate of 2.54 lines/s that is 7.9 us/s —
+  **0.0008% of one core**. There is no CPU win here. Worse, suppressing DEBUG in release would
+  delete the diagnostics that made this session's OCR work possible: `[ProcessingManager] Region
+  OCR: N/M tiles, N% energy saved, N.Nms` is a `Log.debug`, and it is what proved region OCR was
+  the hot path. The real problem was noise, not level — fixed by logging pause-reminder
+  transitions instead of ticks (−19.6% of all lines). Note `Log` takes `String` rather than
+  `@autoclosure`, so interpolations are eager; that costs nothing today because nothing is
+  suppressed, but it is the thing to change first if suppression is ever added._  
   _In release builds, skip stdout+file writes for DEBUG-level logs (wrap the printToConsole default in #if DEBUG, or add an early `guard level != .debug || isDebugBuild` in printFormatted). Keep INFO and above in the file…_ (risk:low, 🟢 safe to land by inspection)
 - `RetentionManager.swift:231` ✅ — **cleanupOrphanedNodes runs a full-table anti-join scan every hourly cleanup even when zero frames were deleted**  
   _Guard step 5: only call cleanupOrphanedNodes() when deletedFrameCount > 0 (frames are the only thing deleted in this pass that can orphan nodes). Optionally also run it once at startup to catch historical orphans._ (risk:low, 🟢 safe to land by inspection)
@@ -111,6 +127,12 @@ Companion to the security tracking issue (#35). A **Fable 5** fleet swept the tr
   _Add a cheap pre-filter: skip a window start unless the token at `start` matches (or prefix-matches) the phrase's first token, and compute the node-order span incrementally instead of building a Set per window (node…_ (risk:medium, 🟡 wants a build/profile or migration)
 - `HEVCEncoder.swift:540` 🔶 plausible — **Three filesystem stat calls per encoded frame on the encode hot path**  
   _Keep the size stat at line 546 (it drives durable-frontier tracking) but drop the two fileExists calls, or gate the deletion check to every ~30 frames / once per fragment. A deleted file is still caught by the size stat…_ (risk:medium, 🟡 wants a build/profile or migration)
+
+### Logging, measured (2026-08-17)
+`Log.debug` costs 3.1 us/call; the app writes 2.54 lines/s, i.e. 0.0008% of one core. Logging is a
+signal-to-noise problem, not a performance one. The fix that mattered was `PauseReminderManager`,
+which logged an unchanged status line every tick: **3,823 lines encoding 4 real state changes**,
+19.6% of the entire log. Now logs transitions only (b7e9659).
 
 ### ⭐ Found by measurement, not in the original sweep (2026-08-17)
 - `VisionOCR.swift:591` ✅ **LANDED** — **Region OCR paid for Vision's language-correction pass on every frame**  
