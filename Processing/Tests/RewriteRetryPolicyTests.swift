@@ -192,6 +192,32 @@ private struct RewriteTestTimeout: Error {
     let stage: String
 }
 
+/// Delivers whichever of two racing tasks finishes first and ignores the loser.
+private actor FirstRewriteTestOutcome<T: Sendable> {
+    private var resolved: Result<T, Error>?
+    private var waiter: CheckedContinuation<Result<T, Error>, Never>?
+
+    func resolve(_ outcome: Result<T, Error>) {
+        guard resolved == nil else { return }
+        resolved = outcome
+
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: outcome)
+        }
+    }
+
+    func firstOutcome() async -> Result<T, Error> {
+        if let resolved {
+            return resolved
+        }
+
+        return await withCheckedContinuation { continuation in
+            waiter = continuation
+        }
+    }
+}
+
 private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingStorage {
     private var rewriteAttemptCount = 0
     private var firstRewriteStarted = false
@@ -466,6 +492,14 @@ final class RewriteRetryPolicyTests: XCTestCase {
     /// the entire run with it — one stuck test made the full suite unrunnable rather
     /// than merely red. This converts that into a named failure at the exact stage
     /// that stalled.
+    ///
+    /// The operation runs as an unstructured task deliberately. A task group cannot return
+    /// until every child has finished, and `cancelAll()` does nothing to a child parked in a
+    /// non-cancellable `withCheckedContinuation` — which is exactly what the waits here do.
+    /// A group-based timeout therefore reported the failure and *then* wedged the process
+    /// during teardown, leaving the run unable to finish even though it knew the answer.
+    /// Abandoning an unstructured task leaks a suspended task instead, which costs a little
+    /// memory and lets the suite report and move on.
     private func withTestTimeout<T: Sendable>(
         _ stage: String,
         seconds: Double = 20,
@@ -473,22 +507,36 @@ final class RewriteRetryPolicyTests: XCTestCase {
         line: UInt = #line,
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T?.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(seconds), clock: .continuous)
-                return nil
-            }
+        let outcome = FirstRewriteTestOutcome<T>()
 
-            defer { group.cancelAll() }
-            while let result = try await group.next() {
-                if let result {
-                    return result
-                }
-                XCTFail("Timed out after \(seconds)s waiting for: \(stage)", file: file, line: line)
-                throw RewriteTestTimeout(stage: stage)
+        let operationTask = Task {
+            do {
+                await outcome.resolve(.success(try await operation()))
+            } catch {
+                await outcome.resolve(.failure(error))
             }
-            throw RewriteTestTimeout(stage: stage)
+        }
+        let timeoutTask = Task {
+            try? await Task.sleep(for: .seconds(seconds), clock: .continuous)
+            await outcome.resolve(.failure(RewriteTestTimeout(stage: stage)))
+        }
+        defer {
+            operationTask.cancel()
+            timeoutTask.cancel()
+        }
+
+        switch await outcome.firstOutcome() {
+        case .success(let value):
+            return value
+        case .failure(let error):
+            if let timeout = error as? RewriteTestTimeout {
+                XCTFail(
+                    "Timed out after \(seconds)s waiting for: \(timeout.stage)",
+                    file: file,
+                    line: line
+                )
+            }
+            throw error
         }
     }
 
