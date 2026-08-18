@@ -64,8 +64,13 @@ public enum Log {
 
     // MARK: - Log File (for fast feedback diagnostics)
 
-    /// Path to the log file - persists across crashes
-    public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+    /// Path to the log file - persists across crashes.
+    ///
+    /// Resolved the same way the writer resolves it, so readers (feedback diagnostics)
+    /// and the writer never disagree about which file is the log.
+    public static var logFilePath: String {
+        NSHomeDirectory() + "/Library/Logs/Retrace/" + LogFile.resolveLogFileName()
+    }
     /// Get recent logs from the log file (fast file read, no OSLogStore)
     public static func getRecentLogs(maxCount: Int = 200) -> [String] {
         LogFile.shared.readLastLines(count: maxCount)
@@ -402,7 +407,7 @@ private final class LogFile: @unchecked Sendable {
     /// `swift test` sets none of the usual `XCTest*` environment variables (verified,
     /// not assumed), so detect the loaded XCTest runtime instead. `RETRACE_LOG_FILE`
     /// overrides the choice outright.
-    private static func resolveLogFileName() -> String {
+    fileprivate static func resolveLogFileName() -> String {
         if let override = ProcessInfo.processInfo.environment["RETRACE_LOG_FILE"],
            !override.isEmpty {
             return override
