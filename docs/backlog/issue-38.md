@@ -75,7 +75,14 @@ Companion to the security tracking issue (#35). A **Fable 5** fleet swept the tr
   _Add a batched database.getFrames(ids: [FrameID]) -> [FrameID: FrameRef] (single WHERE id IN (...) query) and build results from the returned map; or better, have ftsEngine.search return segmentID in the match row via a…_ (risk:medium, 🟡 wants a build/profile or migration)
 - `FrameProcessingQueue.swift:992` ✅ — **enqueueBatch issues one DB call (and transaction) per frame**  
   _Add a DatabaseManager batch API (single transaction inserting all queue rows / one `UPDATE ... WHERE frame_id IN (...)` for status changes) and call it from enqueueBatch and markVideoRewritePlanStatus. Falls back to the…_ (risk:low, 🟡 wants a build/profile or migration)
-- `FrameProcessingQueue.swift:1346` ✅ — **Per-frame memory-ledger snapshots dominate OCR queue overhead**  
+- `FrameProcessingQueue.swift:1346` ❌ **MEASURED AND REJECTED (2026-08-17)** — **Per-frame memory-ledger snapshots dominate OCR queue overhead**  
+  _Measured, not assumed. `OCRStageMemoryLedgerCostTests` mirrors the exact per-frame sequence
+  (residual epoch + 4 `MemoryLedger.snapshot(waitForPendingUpdates:)` + the `setResidual` writes)
+  against a production-sized 49-component ledger: **0.87 ms/frame** idle, **0.85 ms/frame** with a
+  concurrent writer. The denominator comes from the live app's own log — 1,255 real OCR'd frames,
+  **mean 667 ms/frame** (median 440 ms, p90 1.60 s). The ledger is therefore **0.13% of OCR time**;
+  at the observed 589 frames/hour, gating it saves 0.51 s/hour, or 0.014% of one core. The premise
+  "dominates OCR queue overhead" is false. Not worth the risk to an always-on path._  
   _Add a single cached instrumentation-enabled flag (e.g. `retrace.debug.ocrMemoryLedgerEnabled` UserDefaults read once, same pattern as OCRMemoryBackpressurePolicy). In performOCRStage and VisionOCR, when disabled: skip…_ (risk:low, 🟡 wants a build/profile or migration)
 - `FrameQueries.swift:1218` ✅ — **N+1 per-frame delete loop in retention purge path**  
   _Batch by chunks of ~500 IDs: `SELECT docid FROM doc_segment WHERE frameId IN (...)`, `DELETE FROM doc_segment WHERE frameId IN (...)`, `DELETE FROM searchRanking WHERE rowid IN (...docids not still referenced...)`,…_ (risk:medium, 🟡 wants a build/profile or migration)
