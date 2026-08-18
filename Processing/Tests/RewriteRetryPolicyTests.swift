@@ -300,6 +300,13 @@ private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingSto
 }
 
 final class RewriteRetryPolicyTests: XCTestCase {
+    /// The secret the fixtures encrypt node text with.
+    ///
+    /// It is injected into the queue rather than read from the Keychain: `processPendingRewrites`
+    /// defers with `.missingMasterKey` when no app-wide secret exists, so reading real machine
+    /// state would make every rewrite here depend on whether the host happens to have run the app.
+    private static let testAppWideSecret = "test-secret"
+
     private var database: DatabaseManager!
     private var queue: FrameProcessingQueue!
     private var storage: FailingRewriteStorage!
@@ -320,7 +327,8 @@ final class RewriteRetryPolicyTests: XCTestCase {
                 maxRetryAttempts: 3,
                 maxQueueSize: 1000,
                 retryableRewriteRetryDelayNs: 50_000_000
-            )
+            ),
+            appWideSecretProvider: { Self.testAppWideSecret }
         )
     }
 
@@ -379,7 +387,8 @@ final class RewriteRetryPolicyTests: XCTestCase {
                 maxRetryAttempts: 3,
                 maxQueueSize: 1000,
                 retryableRewriteRetryDelayNs: 50_000_000
-            )
+            ),
+            appWideSecretProvider: { Self.testAppWideSecret }
         )
 
         let fixture = try await insertVideoFixture(frameCount: 2)
@@ -623,7 +632,7 @@ final class RewriteRetryPolicyTests: XCTestCase {
             text,
             frameID: frameID.value,
             nodeOrder: 0,
-            secret: "test-secret"
+            secret: Self.testAppWideSecret
         ) ?? text
         try await database.insertNodes(
             frameID: frameID,
