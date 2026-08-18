@@ -122,6 +122,37 @@ public enum BGRAImageUtilities {
         )
     }
 
+    /// Destroys every pixel in a region by overwriting it with opaque black.
+    ///
+    /// This is redaction. It is deliberately one-way: nothing about the original pixels
+    /// survives the call, so no key, no reassembly attack and no future key compromise can
+    /// bring the content back.
+    ///
+    /// It replaces `ReversibleOCRScrambler.scramblePatchBGRA`, which only permuted 2-16px
+    /// blocks into a key-seeded order. That left every original pixel intact in the stored
+    /// frame, so the region was recoverable **without** the master key by jigsaw/edge-matching
+    /// reassembly, and small regions had permutation spaces small enough to brute-force by eye
+    /// (a 2x2 block patch has 24 arrangements). See docs/backlog/issue-34.md.
+    ///
+    /// The buffer is BGRA, little-endian, alpha-first, so bytes run B, G, R, A and alpha is
+    /// set to fully opaque rather than left at zero.
+    public static func destructivelyRedactPatch(_ patch: inout BGRAPatch) {
+        patch.data.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            let bytes = base.assumingMemoryBound(to: UInt8.self)
+            for row in 0..<patch.height {
+                let rowStart = row * patch.bytesPerRow
+                for column in 0..<patch.width {
+                    let pixel = rowStart + column * 4
+                    bytes[pixel] = 0        // B
+                    bytes[pixel + 1] = 0    // G
+                    bytes[pixel + 2] = 0    // R
+                    bytes[pixel + 3] = 255  // A, opaque
+                }
+            }
+        }
+    }
+
     public static func writePatch(
         _ patch: BGRAPatch,
         into frameData: inout Data,
