@@ -170,13 +170,20 @@ public actor WALManager {
                 fileHandle.seekToEndOfFile()
             }
 
+            // LZ4, not JPEG: OCR reads unfinalized frames from here, and JPEG (even
+            // q=1.0) changed ~19-26% of OCR tokens per frame on real captures
+            // (2026-09-22), while Vision on identical input is deterministic.
+            // Readers detect a compressed payload by (dataSize != bytesPerRow*height)
+            // + walLZ4Magic, so pre-existing raw frames.bin files remain readable.
+            let payload = Self.encodeWALPayload(frame) ?? frame.imageData
+
             // Write frame header + pixel data
             let header = WALFrameHeader(
                 timestamp: frame.timestamp.timeIntervalSince1970,
                 width: UInt32(frame.width),
                 height: UInt32(frame.height),
                 bytesPerRow: UInt32(frame.bytesPerRow),
-                dataSize: UInt32(frame.imageData.count),
+                dataSize: UInt32(payload.count),
                 displayID: frame.metadata.displayID,
                 appBundleIDLength: UInt16(frame.metadata.appBundleID?.utf8.count ?? 0),
                 appNameLength: UInt16(frame.metadata.appName?.utf8.count ?? 0),
@@ -233,11 +240,11 @@ public actor WALManager {
                 }
             }
 
-            // Write pixel data
+            // Write pixel data (compressed payload, or raw on encode fallback)
             if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: frame.imageData)
+                try fileHandle.write(contentsOf: payload)
             } else {
-                fileHandle.write(frame.imageData)
+                fileHandle.write(payload)
             }
         } catch {
             throw makeStorageWriteError(
@@ -1331,20 +1338,83 @@ public actor WALManager {
             label: "pixel data at offset \(frameOffset)"
         )
 
+        let metadata = FrameMetadata(
+            appBundleID: appBundleID,
+            appName: appName,
+            windowName: windowName,
+            browserURL: browserURL,
+            displayID: header.displayID
+        )
+
+        // A payload carrying the compressed signature that fails to decompress to
+        // exactly bytesPerRow*height is a corrupt record: reject it at the WAL
+        // boundary rather than hand consumers an undersized buffer typed as raw BGRA.
+        if Self.isCompressedWALPayload(pixelData, header: header) {
+            let decoded: Data
+            do {
+                decoded = try Self.decodeWALPayload(pixelData, header: header)
+            } catch {
+                throw StorageError.fileReadFailed(
+                    path: framesURL.path,
+                    underlying: "Corrupt compressed WAL frame at offset \(frameOffset): \(error.localizedDescription)"
+                )
+            }
+            return CapturedFrame(
+                timestamp: Date(timeIntervalSince1970: header.timestamp),
+                imageData: decoded,
+                width: Int(header.width),
+                height: Int(header.height),
+                bytesPerRow: Int(header.bytesPerRow),
+                metadata: metadata
+            )
+        }
+
         return CapturedFrame(
             timestamp: Date(timeIntervalSince1970: header.timestamp),
             imageData: pixelData,
             width: Int(header.width),
             height: Int(header.height),
             bytesPerRow: Int(header.bytesPerRow),
-            metadata: FrameMetadata(
-                appBundleID: appBundleID,
-                appName: appName,
-                windowName: windowName,
-                browserURL: browserURL,
-                displayID: header.displayID
-            )
+            metadata: metadata
         )
+    }
+
+    // MARK: - WAL payload compression
+
+    /// Prefix on compressed payloads. A raw frame always satisfies
+    /// dataSize == bytesPerRow*height, and encode refuses to emit that size, so
+    /// the two can never be confused.
+    static let walLZ4Magic: [UInt8] = Array("RWZ4".utf8)
+
+    /// Returns nil (caller writes raw) if compression fails or would not shrink the payload.
+    static func encodeWALPayload(_ frame: CapturedFrame) -> Data? {
+        guard let compressed = try? (frame.imageData as NSData).compressed(using: .lz4) as Data else {
+            return nil
+        }
+        var data = Data(walLZ4Magic)
+        data.append(compressed)
+        let rawSize = frame.bytesPerRow * frame.height
+        guard data.count < frame.imageData.count, data.count != rawSize else { return nil }
+        return data
+    }
+
+    private static func isCompressedWALPayload(_ payload: Data, header: WALFrameHeader) -> Bool {
+        let rawSize = Int(header.bytesPerRow) * Int(header.height)
+        guard payload.count != rawSize, payload.count > walLZ4Magic.count else { return false }
+        return payload.prefix(walLZ4Magic.count).elementsEqual(walLZ4Magic)
+    }
+
+    private static func decodeWALPayload(_ payload: Data, header: WALFrameHeader) throws -> Data {
+        let body = payload.dropFirst(walLZ4Magic.count)
+        let decoded = try (Data(body) as NSData).decompressed(using: .lz4) as Data
+        let rawSize = Int(header.bytesPerRow) * Int(header.height)
+        guard decoded.count == rawSize else {
+            throw StorageError.fileReadFailed(
+                path: "",
+                underlying: "Decompressed WAL payload is \(decoded.count) bytes, expected \(rawSize)"
+            )
+        }
+        return decoded
     }
 
     private func currentOffset(fileHandle: FileHandle) -> UInt64 {
