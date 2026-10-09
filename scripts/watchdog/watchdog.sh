@@ -28,7 +28,11 @@ set -uo pipefail
 
 APP_PATH="/Applications/Retrace.app"
 APP_NAME="Retrace"
-SUPPORT_DIR="$HOME/Library/Application Support/Retrace"
+# Must match AppPaths.storageRoot, or the heartbeat/DB checks read a stale copy and
+# restart a healthy app in a loop.
+SUPPORT_DIR="$(defaults read io.retrace.app customRetraceDBLocation 2>/dev/null)"
+SUPPORT_DIR="${SUPPORT_DIR:-$HOME/Library/Application Support/Retrace}"
+SUPPORT_DIR="${SUPPORT_DIR/#\~/$HOME}"
 DB_PATH="$SUPPORT_DIR/retrace.db"
 HEARTBEAT="$SUPPORT_DIR/.retrace_keepalive"
 
