@@ -270,10 +270,29 @@ actor TimelineStillDiskWriter {
         let frame: CapturedFrame
     }
 
+    /// Nothing else prunes these stills unless a timeline view model is alive, so the
+    /// writer owns their retention (88 GB accumulated across one launch on 2026-10-09).
+    struct Retention: Sendable {
+        let directoryURL: URL
+        /// Stills younger than this are kept even over the byte cap: their 5-minute video
+        /// segment may not be readable yet, and the still is then the only preview.
+        var minimumAge: TimeInterval = 10 * 60
+        var maximumAge: TimeInterval = 20 * 60
+        var maximumBytes: Int64 = 512 * 1024 * 1024
+        var sweepInterval: TimeInterval = 60
+    }
+
+    struct SweepResult: Equatable, Sendable {
+        var removedCount = 0
+        var removedBytes: Int64 = 0
+        var remainingBytes: Int64 = 0
+    }
+
     typealias DestinationResolver = @Sendable (Int64) -> URL
     typealias Encoder = @Sendable (CapturedFrame) throws -> Data
     typealias WarningLogger = @Sendable (String) -> Void
 
+    private let retention: Retention?
     private let destinationResolver: DestinationResolver
     private let encoder: Encoder
     private let warningLogger: WarningLogger
@@ -286,6 +305,7 @@ actor TimelineStillDiskWriter {
 
     init(
         bufferLimit: Int,
+        retention: Retention? = nil,
         destinationResolver: @escaping DestinationResolver,
         encoder: @escaping Encoder,
         warningLogger: @escaping WarningLogger
@@ -293,6 +313,7 @@ actor TimelineStillDiskWriter {
         let (stream, continuation) = AsyncStream<WriteRequest>.makeStream(
             bufferingPolicy: .bufferingNewest(bufferLimit)
         )
+        self.retention = retention
         self.destinationResolver = destinationResolver
         self.encoder = encoder
         self.warningLogger = warningLogger
@@ -350,9 +371,24 @@ actor TimelineStillDiskWriter {
         let destinationResolver = self.destinationResolver
         let encoder = self.encoder
         let warningLogger = self.warningLogger
+        let retention = self.retention
 
         workerTask = Task.detached(priority: .utility) {
+            var lastSweepAt: Date?
             for await request in stream {
+                if let retention {
+                    let now = Date()
+                    if lastSweepAt.map({ now.timeIntervalSince($0) >= retention.sweepInterval }) ?? true {
+                        lastSweepAt = now
+                        let result = Self.sweep(retention, now: now)
+                        if result.removedCount > 0 {
+                            Log.info(
+                                "[Timeline-DiskBuffer] Swept \(result.removedCount) capture-time stills (\(result.removedBytes) bytes), \(result.remainingBytes) bytes remain",
+                                category: .app
+                            )
+                        }
+                    }
+                }
                 do {
                     let destinationURL = destinationResolver(request.frameID)
                     let jpegData = try encoder(request.frame)
@@ -375,6 +411,43 @@ actor TimelineStillDiskWriter {
 
     private func recordWriteSuccess() {
         diagnostics.writtenCount += 1
+    }
+
+    /// Removes `<frameID>.jpg` stills older than `maximumAge`, then oldest-first until the
+    /// directory is under `maximumBytes`, never touching anything younger than `minimumAge`.
+    /// Covers stills the timeline view model wrote too; its reads treat a missing file as a miss.
+    nonisolated static func sweep(_ retention: Retention, now: Date) -> SweepResult {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .contentModificationDateKey, .totalFileAllocatedSizeKey, .fileSizeKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: retention.directoryURL,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return SweepResult()
+        }
+
+        var stills: [(url: URL, modifiedAt: Date, bytes: Int64)] = []
+        for url in urls {
+            guard url.pathExtension.lowercased() == "jpg",
+                  Int64(url.deletingPathExtension().lastPathComponent) != nil,
+                  let values = try? url.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true else { continue }
+            let bytes = Int64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
+            stills.append((url, values.contentModificationDate ?? .distantPast, bytes))
+        }
+        stills.sort { $0.modifiedAt < $1.modifiedAt }
+
+        var result = SweepResult(remainingBytes: stills.reduce(0) { $0 + $1.bytes })
+        for still in stills {
+            let age = now.timeIntervalSince(still.modifiedAt)
+            guard age >= retention.minimumAge else { break }
+            guard age > retention.maximumAge || result.remainingBytes > retention.maximumBytes else { break }
+            guard (try? FileManager.default.removeItem(at: still.url)) != nil else { continue }
+            result.removedCount += 1
+            result.removedBytes += still.bytes
+            result.remainingBytes -= still.bytes
+        }
+        return result
     }
 
     private func recordWriteFailure(
@@ -592,6 +665,7 @@ public actor AppCoordinator {
         self.services = services
         self.timelineStillDiskWriter = TimelineStillDiskWriter(
             bufferLimit: Self.timelineStillWriterBufferLimit,
+            retention: .init(directoryURL: Self.timelineDiskFrameBufferDirectoryURL()),
             destinationResolver: { frameID in
                 Self.timelineDiskFrameBufferURL(for: frameID)
             },
@@ -610,6 +684,7 @@ public actor AppCoordinator {
         self.services = ServiceContainer()
         self.timelineStillDiskWriter = TimelineStillDiskWriter(
             bufferLimit: Self.timelineStillWriterBufferLimit,
+            retention: .init(directoryURL: Self.timelineDiskFrameBufferDirectoryURL()),
             destinationResolver: { frameID in
                 Self.timelineDiskFrameBufferURL(for: frameID)
             },
